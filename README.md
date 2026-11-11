@@ -264,7 +264,7 @@ The scheduler runs inside python api/server.py. Under gunicorn/uwsgi or another 
 She can signal "several consecutive messages" with separators or blank lines:
 
 Good night. After all these tests I don't feel much, just a bit sleepy —
-the calculus chapter is still open on my desk.
+the calculus chapter is still open on my desk. 
 
 ---
 
