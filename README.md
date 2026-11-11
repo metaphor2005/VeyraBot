@@ -1,4 +1,2 @@
 # VeyraBot
-A persistent cognitive framework for anthropomorphic agents.Built on ReAct loop,it manages layered memory,auto memory compression and symbolic persona evolution.
-
-I will ipload it later.
+A continuously running cognitive agent with layered memory, active archiving, and symbolic persona evolution. Every turn archives topics, beliefs, experiences, and relationship temperature; its persona is driven by 14 symbolic parameters and evolves through a baseline + within-day drift + daily settlement loop; retrieval runs only when the judge decides existing material is insufficient, inside a bounded loop. It also supports multi-valued beliefs, affection-threshold events, and proactive outreach whose timing is decided by the LLM after each reply. Pure Python + SQLite, OpenAI-compatible, with a Flask API and a WeChat-style web UI.
