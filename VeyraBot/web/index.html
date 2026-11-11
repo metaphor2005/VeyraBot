@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>江妍</title>
+  <link rel="stylesheet" href="style.css?v=20261111">
+</head>
+<body>
+  <div id="app">
+    <!-- 最左：图标栏（微信式深色竖栏） -->
+    <nav id="rail">
+      <div class="rail-top">
+        <div class="rail-icon active" title="聊天">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 3C6.9 3 3 6.2 3 10.2c0 2.3 1.3 4.4 3.3 5.8l-.8 3 3.4-1.8c1 .3 2 .4 3.1.4 5.1 0 9-3.2 9-7.2S17.1 3 12 3z"/>
+          </svg>
+        </div>
+      </div>
+      <div class="rail-bottom">
+        <button class="rail-icon" id="themeToggle" title="深色模式" aria-label="切换深色模式">
+          <svg class="icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>
+          </svg>
+          <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"/>
+            <path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/>
+          </svg>
+        </button>
+        <button class="rail-icon" id="settingsBtn" title="设置" aria-label="设置">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M19.4 13a7.5 7.5 0 0 0 .1-1 7.5 7.5 0 0 0-.1-1l2.1-1.6a.5.5 0 0 0 .1-.7l-2-3.4a.5.5 0 0 0-.6-.2l-2.5 1a7.7 7.7 0 0 0-1.7-1l-.4-2.6a.5.5 0 0 0-.5-.4h-4a.5.5 0 0 0-.5.4l-.4 2.7a7.7 7.7 0 0 0-1.7 1l-2.5-1a.5.5 0 0 0-.6.2l-2 3.4a.5.5 0 0 0 .1.7L4.6 11a7.5 7.5 0 0 0 0 2l-2.1 1.6a.5.5 0 0 0-.1.7l2 3.4c.1.2.4.3.6.2l2.5-1a7.7 7.7 0 0 0 1.7 1l.4 2.6c0 .3.2.4.5.4h4c.2 0 .5-.2.5-.4l.4-2.6a7.7 7.7 0 0 0 1.7-1l2.5 1c.2.1.5 0 .6-.2l2-3.4a.5.5 0 0 0-.1-.7L19.4 13zM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"/>
+          </svg>
+        </button>
+      </div>
+    </nav>
+
+    <!-- 会话列表：只有她一个人 -->
+    <aside id="sidebar">
+      <div class="chat-entry">
+        <div class="avatar-wrap">
+          <img class="avatar-img entry-avatar" src="/api/avatar/persona" alt="江妍"
+               onerror="this.hidden=true;this.nextElementSibling.hidden=false">
+          <div class="avatar fb-persona entry-avatar" hidden>妍</div>
+        </div>
+        <div class="entry-meta">
+          <div class="entry-top">
+            <span class="name">江妍</span>
+            <span class="time" id="entryTime"></span>
+          </div>
+          <div class="entry-preview" id="entryPreview">她会记住你们聊过的每一件事</div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 聊天区 -->
+    <main id="chat">
+      <header id="chatHeader">
+        <div class="contact-name">江妍</div>
+      </header>
+
+      <div id="messages" class="messages">
+        <div class="empty-hint">和江妍说点什么吧。<br>她会记住你们聊过的每一件事。</div>
+      </div>
+
+      <div id="typing" class="typing hidden">
+        <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      </div>
+
+      <footer class="composer">
+        <textarea id="input" rows="3" placeholder="输入消息…"></textarea>
+        <div class="composer-row">
+          <span class="composer-hint">Enter 发送 · Shift+Enter 换行</span>
+          <button id="sendBtn" class="send-btn">发送</button>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <!-- 设置窗口（微信式弹窗） -->
+  <div id="settingsOverlay" class="overlay hidden">
+    <div class="modal" role="dialog" aria-label="设置">
+      <div class="modal-title">
+        <span>设置</span>
+        <button id="settingsClose" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <nav class="modal-nav">
+          <div class="modal-nav-item active" data-tab="general">通用</div>
+          <div class="modal-nav-item" data-tab="model">模型连接</div>
+          <div class="modal-nav-item" data-tab="profile">个人</div>
+        </nav>
+        <div class="modal-content">
+          <!-- 通用 -->
+          <section id="tab-general">
+            <div class="setting-row">
+              <div class="setting-label grow">深色模式</div>
+              <label class="switch">
+                <input type="checkbox" id="darkSwitch">
+                <span class="slider"></span>
+              </label>
+            </div>
+            <p class="setting-note">深色模式会调整整个界面的配色，与左下角的切换按钮效果相同。</p>
+          </section>
+
+          <!-- 模型连接 -->
+          <section id="tab-model" class="hidden">
+            <div class="setting-row">
+              <label class="setting-label" for="providerSelect">服务商</label>
+              <select id="providerSelect"></select>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label" for="baseUrlInput">接口地址</label>
+              <input id="baseUrlInput" type="text" spellcheck="false" placeholder="https://…">
+            </div>
+            <div class="setting-row">
+              <label class="setting-label" for="modelInput">模型</label>
+              <input id="modelInput" type="text" list="modelSuggestions" spellcheck="false"
+                     placeholder="模型名称">
+              <datalist id="modelSuggestions"></datalist>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label" for="apiKeyInput">API 密钥</label>
+              <input id="apiKeyInput" type="password" autocomplete="off" placeholder="未设置">
+            </div>
+            <p class="setting-note">密钥只保存在这台电脑上，不会上传到任何地方。换服务商后需要填对应服务商的密钥。</p>
+            <div class="setting-actions">
+              <button id="testConnBtn" class="btn-secondary">测试连接</button>
+              <button id="saveModelBtn" class="btn-primary">保存</button>
+            </div>
+            <div id="modelStatus" class="setting-status"></div>
+          </section>
+
+          <!-- 个人 -->
+          <section id="tab-profile" class="hidden">
+            <div class="profile-avatar-row">
+              <div class="avatar-wrap">
+                <img id="avatarPreview" class="avatar-big" src="/api/avatar/user" alt="我的头像"
+                     onerror="this.hidden=true;this.nextElementSibling.hidden=false">
+                <div id="avatarPreviewFallback" class="avatar avatar-big fb-user" hidden>我</div>
+              </div>
+              <div class="profile-avatar-actions">
+                <button id="chooseAvatarBtn" class="btn-primary">选择图片</button>
+                <button id="resetAvatarBtn" class="btn-secondary">恢复默认</button>
+                <div id="avatarStatus" class="setting-status"></div>
+              </div>
+              <input type="file" id="avatarFile" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+            </div>
+            <p class="setting-note">支持 PNG / JPG / WebP / GIF，不超过 2MB。这张头像会显示在你的消息旁边。</p>
+          </section>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js?v=20261112a"></script>
+</body>
+</html>

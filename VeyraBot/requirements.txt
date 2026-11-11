@@ -1,0 +1,8 @@
+# 本项目运行时依赖说明
+#
+# Python: 3.10+
+# requests：调用 DeepSeek / OpenAI 兼容接口
+# flask：开发者 HTTP API + Web UI（api/server.py）；只用 CLI / demo 可不装
+# mock 模式下连 requests 都不需要
+requests>=2.28.0
+flask>=3.0.0

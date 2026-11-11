@@ -1,0 +1,508 @@
+/* ============================================================
+   微信电脑版风格聊天界面 · 黑白双主题（CSS 变量切换）
+
+   布局：图标栏（深色竖栏） + 会话列表 + 聊天区
+   浅色参照微信 PC 版（白列表 / 灰聊天区 / 绿色出气泡），
+   深色参照微信深色模式。
+   ============================================================ */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+/* HTML hidden 属性必须永远生效：后面的 display:flex / display:block 规则
+   会盖掉 UA 样式表的 [hidden]{display:none}，导致头像位置出现
+   「图片 + 回退框」两个框叠着显示。 */
+[hidden] { display: none !important; }
+
+:root, html[data-theme="light"] {
+  --rail-bg: #2e2e2e;
+  --rail-icon: #8f8f8f;
+  --accent: #07c160;
+  --sidebar-bg: #f7f7f7;
+  --chat-bg: #f5f5f5;
+  --header-bg: #f5f5f5;
+  --composer-bg: #f5f5f5;
+  --text: #1a1a1a;
+  --text-sub: #999999;
+  --border: #e7e7e7;
+  --bubble-in: #ffffff;
+  --bubble-out: #95ec69;       /* 微信绿 */
+  --bubble-out-text: #06120c;
+  --hover: #ededed;
+  --active: #e4e4e4;
+  --sys-text: #9b9b9b;
+  --sys-pill: rgba(0, 0, 0, 0.05);
+  --input-bg: #ffffff;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+  --modal-bg: #f7f7f7;
+  --switch-off: #d9d9d9;
+  --badge-cold: #e6a23c;
+  --badge-broken: #f56c6c;
+}
+
+html[data-theme="dark"] {
+  --rail-bg: #111111;
+  --rail-icon: #8a8a8a;
+  --accent: #07c160;
+  --sidebar-bg: #191919;
+  --chat-bg: #111111;
+  --header-bg: #111111;
+  --composer-bg: #141414;
+  --text: #d6d6d6;
+  --text-sub: #7f7f7f;
+  --border: #262626;
+  --bubble-in: #2c2c2c;
+  --bubble-out: #3eb575;       /* 深色模式下的墨绿 */
+  --bubble-out-text: #06120c;
+  --hover: #212121;
+  --active: #2a2a2a;
+  --sys-text: #8c8c8c;
+  --sys-pill: rgba(255, 255, 255, 0.06);
+  --input-bg: #1f1f1f;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --modal-bg: #1f1f1f;
+  --switch-off: #3a3a3a;
+  --badge-cold: #c88a2e;
+  --badge-broken: #d05656;
+}
+
+html, body {
+  height: 100%;
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  background: var(--chat-bg);
+  color: var(--text);
+  overflow: hidden;
+}
+
+#app { display: flex; height: 100vh; width: 100vw; overflow: hidden; }
+
+/* ============================================================
+   图标栏（最左竖栏）
+   ============================================================ */
+#rail {
+  width: 52px;
+  flex-shrink: 0;
+  background: var(--rail-bg);
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 0;
+}
+
+.rail-top, .rail-bottom { display: flex; flex-direction: column; gap: 6px; }
+
+.rail-icon {
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--rail-icon);
+  cursor: pointer;
+}
+.rail-icon svg { width: 22px; height: 22px; }
+.rail-icon:hover { color: #ffffff; background: rgba(255, 255, 255, 0.1); }
+.rail-icon.active { color: var(--accent); }
+
+/* 深色切换按钮：浅色显示月亮、深色显示太阳 */
+html[data-theme="light"] .icon-sun { display: none; }
+html[data-theme="dark"] .icon-moon { display: none; }
+
+/* ============================================================
+   会话列表（唯一的联系人）
+   ============================================================ */
+#sidebar {
+  width: 250px;
+  min-width: 200px;
+  flex-shrink: 0;
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding-top: 14px;
+}
+
+.chat-entry {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  background: var(--active);
+  border-radius: 0;
+}
+
+/* 头像（列表 42px，消息区 36px，设置预览 72px） */
+.avatar-wrap { position: relative; flex-shrink: 0; display: flex; }
+.avatar-img, .avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  object-fit: cover;
+  display: block;
+}
+.entry-avatar.avatar-img, .entry-avatar.avatar { width: 42px; height: 42px; }
+.avatar-big { width: 72px; height: 72px; border-radius: 10px; }
+
+/* 头像加载失败的文字回退 */
+.avatar-fallback, .fb-persona, .fb-user {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  color: #fff;
+}
+.fb-persona { background: linear-gradient(135deg, #f76b1c 0%, #ff9a44 100%); }
+.fb-user { background: #5b7bd5; }
+.avatar-big.fb-user { font-size: 24px; }
+
+.entry-meta { flex: 1; min-width: 0; }
+.entry-top { display: flex; justify-content: space-between; align-items: baseline; }
+.entry-top .name { font-size: 14px; font-weight: 500; }
+.entry-top .time { font-size: 11px; color: var(--text-sub); flex-shrink: 0; margin-left: 8px; }
+.entry-preview {
+  font-size: 12px;
+  color: var(--text-sub);
+  margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.entry-preview .notice { color: var(--badge-cold); }
+
+/* ============================================================
+   聊天区
+   ============================================================ */
+#chat { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--chat-bg); }
+
+#chatHeader {
+  height: 58px;
+  flex-shrink: 0;
+  padding: 0 24px;
+  display: flex;
+  align-items: center;
+  background: var(--header-bg);
+  border-bottom: 1px solid var(--border);
+}
+.contact-name { font-size: 16px; font-weight: 600; }
+
+/* 消息流 */
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 26px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.empty-hint {
+  margin: auto;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-sub);
+  line-height: 2;
+}
+
+/* 消息气泡 */
+.msg { display: flex; gap: 10px; align-items: flex-start; max-width: 78%; }
+.msg.in { align-self: flex-start; }
+.msg.out { align-self: flex-end; flex-direction: row-reverse; }
+
+.msg-bubble {
+  padding: 9px 12px;
+  border-radius: 6px;
+  font-size: 14px;
+  line-height: 1.55;
+  word-break: break-word;
+  white-space: pre-wrap;
+  position: relative;
+  box-shadow: var(--shadow);
+}
+.msg.in .msg-bubble { background: var(--bubble-in); }
+.msg.out .msg-bubble { background: var(--bubble-out); color: var(--bubble-out-text); }
+
+/* 气泡小尖角（微信式）：三角形宽 6px，必须偏移 6px 才能与气泡边缘
+   严丝合缝；偏移 -11px 会留 5px 空隙，看起来像浮在气泡旁边的小图形 */
+.msg.in .msg-bubble::before,
+.msg.out .msg-bubble::after {
+  content: "";
+  position: absolute;
+  top: 12px;
+  width: 0; height: 0;
+  border: 6px solid transparent;
+}
+.msg.in .msg-bubble::before { left: -6px; border-right-color: var(--bubble-in); border-left: none; }
+.msg.out .msg-bubble::after { right: -6px; border-left-color: var(--bubble-out); border-right: none; }
+
+/* 时间分隔条 */
+.time-divider {
+  align-self: center;
+  font-size: 11px;
+  color: var(--sys-text);
+  padding: 2px 8px;
+}
+
+/* 系统通知（主动消息 / 断交声明） */
+.sys {
+  align-self: center;
+  max-width: 86%;
+  background: var(--sys-pill);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--sys-text);
+  text-align: center;
+  line-height: 1.7;
+}
+.sys .sys-kind {
+  display: inline-block;
+  padding: 0 6px;
+  margin-right: 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #fff;
+}
+.sys-kind.k-reach_out { background: var(--badge-cold); }
+.sys-kind.k-severance { background: var(--badge-broken); }
+.sys-kind.k-reconcile { background: var(--accent); }
+.sys .sys-text { color: var(--text); }
+
+/* 正在输入 */
+.typing {
+  align-self: flex-start;
+  margin-left: 46px;
+  padding: 10px 14px;
+  background: var(--bubble-in);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+  display: flex;
+  gap: 4px;
+}
+.typing.hidden { display: none; }
+.typing .dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--text-sub);
+  animation: blink 1.2s infinite ease-in-out;
+}
+.typing .dot:nth-child(2) { animation-delay: 0.2s; }
+.typing .dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes blink {
+  0%, 80%, 100% { opacity: 0.25; }
+  40% { opacity: 1; }
+}
+
+/* ============================================================
+   输入区
+   ============================================================ */
+.composer {
+  border-top: 1px solid var(--border);
+  background: var(--composer-bg);
+  padding: 10px 16px 12px;
+  flex-shrink: 0;
+}
+.composer textarea {
+  width: 100%;
+  min-height: 56px;
+  max-height: 140px;
+  resize: none;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.5;
+  font-family: inherit;
+}
+.composer-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 6px;
+}
+.composer-hint { font-size: 11px; color: var(--text-sub); }
+.send-btn {
+  padding: 6px 22px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.send-btn:hover { filter: brightness(1.05); }
+.send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ============================================================
+   设置窗口（微信式弹窗）
+   ============================================================ */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.overlay.hidden { display: none; }
+
+.modal {
+  width: 640px;
+  max-width: 92vw;
+  height: 460px;
+  max-height: 86vh;
+  background: var(--modal-bg);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.modal-title {
+  height: 48px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 15px;
+  font-weight: 600;
+}
+.modal-title button {
+  border: none;
+  background: transparent;
+  color: var(--text-sub);
+  font-size: 15px;
+  cursor: pointer;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+}
+.modal-title button:hover { background: var(--hover); color: var(--text); }
+
+.modal-body { flex: 1; display: flex; min-height: 0; }
+
+.modal-nav {
+  width: 140px;
+  flex-shrink: 0;
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--border);
+  padding: 10px 8px;
+}
+.modal-nav-item {
+  padding: 9px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--text);
+}
+.modal-nav-item:hover { background: var(--hover); }
+.modal-nav-item.active { background: var(--active); font-weight: 600; }
+
+.modal-content { flex: 1; padding: 18px 22px; overflow-y: auto; }
+.modal-content section.hidden { display: none; }
+
+.setting-row { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.setting-label { width: 72px; flex-shrink: 0; font-size: 13px; }
+.setting-label.grow { flex: 1; width: auto; font-size: 14px; }
+
+.setting-row input[type="text"],
+.setting-row input[type="password"],
+.setting-row select {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--input-bg);
+  color: var(--text);
+  outline: none;
+  font-family: inherit;
+}
+.setting-row input:focus, .setting-row select:focus { border-color: var(--accent); }
+
+.setting-note {
+  font-size: 12px;
+  color: var(--text-sub);
+  line-height: 1.7;
+  margin-bottom: 14px;
+}
+.setting-actions { display: flex; gap: 10px; margin-top: 4px; }
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 20px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.btn-primary:hover { filter: brightness(1.06); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-secondary {
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 16px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.btn-secondary:hover { background: var(--hover); }
+
+.setting-status {
+  font-size: 12px;
+  margin-top: 10px;
+  min-height: 16px;
+  line-height: 1.6;
+  color: var(--text-sub);
+}
+.setting-status.ok { color: var(--accent); }
+.setting-status.err { color: var(--badge-broken); }
+
+/* 深色模式开关（iOS 式拨动） */
+.switch { position: relative; width: 44px; height: 24px; flex-shrink: 0; display: inline-block; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider {
+  position: absolute;
+  inset: 0;
+  background: var(--switch-off);
+  border-radius: 12px;
+  transition: 0.2s;
+  cursor: pointer;
+}
+.slider::before {
+  content: "";
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  left: 2px;
+  top: 2px;
+  background: #fff;
+  border-radius: 50%;
+  transition: 0.2s;
+}
+.switch input:checked + .slider { background: var(--accent); }
+.switch input:checked + .slider::before { transform: translateX(20px); }
+
+/* 个人 - 头像 */
+.profile-avatar-row { display: flex; gap: 20px; align-items: flex-start; margin-top: 6px; }
+.profile-avatar-actions { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 7px; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-sub); }
+
+/* 窄窗口：收起会话列表（微信窄窗行为） */
+@media (max-width: 720px) {
+  #sidebar { display: none; }
+}
