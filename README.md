@@ -644,11 +644,18 @@ Tuning hints:
 | No subjective experience | the self is readable, writable, retrievable belief data | this is a structural simulation, not consciousness |
 | TF-IDF retrieval | no external dependency, explainable | replace `VectorStore.add/search/count` to plug in local embeddings |
 | Proactive contact depends on an in-process thread | shipped with `python api/server.py`; WSGI deployments need an external timer | dedicated worker or task queue |
-| Memory sampling may repeat | randomly samples from the latest 200 topics/experiences/beliefs | track recently used `topic_id`s and exclude them short-term |
+| Memory sampling may repeat | short-term cooldown (`REMEMBER_COOLDOWN_MINUTES`) + topic-affinity weighting now reduce repeats | still heuristic; a longer-horizon "last contacted about" log would be stronger |
 | Affection only affects the prompt | relationship temperature is injected, but there is no separate warm/distant phrasing tier | add high/medium/low expression tiers |
 | Extraction JSON can truncate | automatic budget expansion + degraded archiving | streaming incremental JSON parsing |
 | Daily consolidation depends on a scheduled task | `install_schedule.ps1` provided | `StartWhenAvailable` catches up after a missed run |
 | 50-turn window is token-bound | older history is compressed above the threshold | raise `MAX_SAFE_TOKENS` with long-context models |
+
+### Deferred in this round (planned next)
+
+Two items are intentionally unfinished; they are recorded here so they are not mistaken for completed work:
+
+1. **API runtime verification.** `api/server.py` compiles and is covered by offline tests, but it has not been started end-to-end in this development environment because Flask is not installed in the system Python used here. Before exposing the service, install `requirements.txt` in a clean environment, run `python api/server.py`, then verify `/api/health`, `/api/chat`, and the belief / persona / proactive endpoints.
+2. **Production-grade background tasks.** The current `task` table + `TaskStore` + `_run_tasks` is a runnable, retryable, resumable **in-process** version, not a separate worker. On multi-worker WSGI deployments, scheduling and retry should move to a dedicated worker or queue (Redis / Celery / RQ). The rate limiter is also an in-process sliding window and should move to the gateway or a shared store.
 
 ---
 

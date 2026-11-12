@@ -35,6 +35,9 @@ _INITIATIVE_TEMPLATES = (
 # 各类记忆的抽样权重：往事最有"聊天感"，经验次之，结构化事实兜底
 _MEMORY_WEIGHTS = {"topic": 5.0, "experience": 3.0, "relation": 2.0}
 
+# 最近使用过的记忆（避免主动联系反复抽同一件事）
+_RECENT_USED: Dict[str, int] = {}
+
 # 兜底文案里最多展示多少个字，避免把整段摘要塞进一句话
 _FALLBACK_MEMORY_CHARS = 36
 
@@ -63,7 +66,7 @@ class ProactiveInitiator:
     # ------------------------------------------------------------
     # 记忆抽样
     # ------------------------------------------------------------
-    def choose_memory(self, space_id: str) -> Optional[Dict[str, Any]]:
+    def choose_memory(self, space_id: str, query: str = "") -> Optional[Dict[str, Any]]:
         """
         从记忆库里随机抽一段可以用来"搭话"的内容。
 
@@ -153,7 +156,34 @@ class ProactiveInitiator:
         if not candidates:
             return None
 
-        return self.rng.choices(candidates, weights=weights, k=1)[0]
+        # 冷却窗口：最近用过的主题/经验先不重复抽；话题命中的加权
+        now = int(time.time())
+        cooldown = max(0, int(config.REMEMBER_COOLDOWN_MINUTES)) * 60
+        filtered: List[Dict[str, Any]] = []
+        filtered_weights: List[float] = []
+        for item, weight in zip(candidates, weights):
+            key_id = item.get("topic_id") or item.get("text", "")[:24]
+            key = f"{space_id}:{key_id}"
+            last = _RECENT_USED.get(key, 0)
+            if cooldown and now - last < cooldown:
+                continue
+            if query:
+                title = item.get("title") or ""
+                if (title and title in query) or (item.get("text") and item["text"][:6] in query):
+                    weight += 2.0
+            filtered.append(item)
+            filtered_weights.append(weight)
+
+        if filtered:
+            candidates, weights = filtered, filtered_weights
+        else:
+            # 全部在冷却中：允许重抽，但降低权重，避免完全发不出去
+            weights = [max(0.1, w * 0.3) for w in weights]
+
+        chosen = self.rng.choices(candidates, weights=weights, k=1)[0]
+        key_id = chosen.get("topic_id") or chosen.get("text", "")[:24]
+        _RECENT_USED[f"{space_id}:{key_id}"] = now
+        return chosen
 
     # ------------------------------------------------------------
     # 组稿

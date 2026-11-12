@@ -235,6 +235,60 @@ _SCHEMA_STATEMENTS = [
         update_ts         integer
     )
     """,
+    # 信念临时禁用（用户"暂时不检索/暂不参与记忆"）：短窗口开关
+    """
+    create table if not exists belief_disable (
+        space_id       text,
+        rid            text,
+        disabled      integer default 0,
+        disabled_ts   integer,            -- 禁用开始时间（秒）
+        expire_ts     integer,            -- 到期时间（秒）
+        create_ts     integer,
+        updated_ts    integer,
+        primary key (space_id, rid)
+    )
+    """,
+    # 后台任务：归档 / 日结 / 任务编排（可重试、可续跑、有幂等）
+    """
+    create table if not exists task (
+        task_id      text primary key,
+        space_id     text,
+        kind         text,
+        action       text,
+        params       text,
+        payload      text,
+        status       text default 'pending',  -- pending / running / done / failed
+        retry_count  integer default 0,
+        max_retries  integer default 3,
+        next_run_ts integer,
+        created_ts   integer,
+        started_ts   integer,
+        finished_ts  integer,
+        failed_ts    integer,
+        unique (space_id, action, params)
+    )
+    """,
+    # 长期运行状态（故事线、待归并积压、上次日结时间）
+    """
+    create table if not exists long_run_state (
+        space_id     text primary key,
+        storyline_id text,
+        events       text,               -- JSON 数组
+        last_update_ts integer,
+        next_update_ts integer,
+        create_ts    integer
+    )
+    """,
+    # 记忆边界统计（用于监控/观测"内存是否开太大"）
+    """
+    create table if not exists memory_bound (
+        space_id     text primary key,
+        kind         text,             -- normal / large / capped
+        vector_count int,
+        relation_count int,
+        updated_ts   integer
+    )
+    """,
 ]
 
 
@@ -263,8 +317,27 @@ _COLUMN_MIGRATIONS = [
     ("kg_relation", "user_confirmed", "user_confirmed integer default 0"),
     # 主题来源轮次：归档幂等的依据（同一轮对话只沉淀一次）
     ("topic", "turn_id", "turn_id text"),
-    # 人格冻结：用户明确要求"她不要再变了"时，停止一切人格参数演化
-    ("persona_meta", "persona_frozen", "persona_frozen integer default 0"),
+    # 记忆边界统计：用于监控"内存是否开太大"
+    ("memory_bound", "vector_count", "vector_count integer"),
+    ("memory_bound", "relation_count", "relation_count integer"),
+    # 长期运行状态（故事线、待归并积压、上次日结时间）
+    ("long_run_state", "events", "events text"),
+    ("long_run_state", "last_update_ts", "last_update_ts integer"),
+    # 信念临时禁用
+    ("belief_disable", "disabled", "disabled integer default 0"),
+    # 后台任务
+    ("task", "params", "params text"),
+    ("task", "payload", "payload text"),
+    ("task", "status", "status text default 'pending'"),
+    ("task", "retry_count", "retry_count integer default 0"),
+    ("task", "max_retries", "max_retries integer default 3"),
+    ("task", "next_run_ts", "next_run_ts integer"),
+    ("task", "created_ts", "created_ts integer"),
+    ("task", "started_ts", "started_ts integer"),
+    ("task", "finished_ts", "finished_ts integer"),
+    ("task", "failed_ts", "failed_ts integer"),
+    # 记忆边界
+    ("memory_bound", "updated_ts", "updated_ts integer"),
 ]
 
 
@@ -389,3 +462,161 @@ class Database:
                     del self._connections[threading.get_ident()]
             connection.close()
             self._local.conn = None
+
+
+class TaskStore:
+    """后台任务持久化与续跑（幂等、可重试、有状态）。"""
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def create(
+        self,
+        space_id: str,
+        kind: str,
+        action: str,
+        params: Dict[str, Any] = None,
+        payload: Dict[str, Any] = None,
+    ) -> Dict[str, Any]:
+        params = params or {}
+        payload = payload or {}
+        now = int(__import__("time").time())
+        row = self.db.conn().execute(
+            """
+            insert into task
+                (task_id, space_id, kind, action, params, payload, status,
+                 retry_count, max_retries, next_run_ts, created_ts)
+            values (?, ?, ?, ?, ?, ?, 'pending', 0, 3, ?, ?)
+            """,
+            (
+                self._new_id("task"),
+                space_id,
+                kind,
+                action,
+                json.dumps(params, ensure_ascii=False),
+                json.dumps(payload, ensure_ascii=False),
+                now,
+                now + 1,
+                now,
+            ),
+        )
+        self.db.conn().commit()
+        return self.get(self._new_id_after(row))
+
+    def get(self, task_id: str) -> Optional[Dict[str, Any]]:
+        row = self.db.conn().execute(
+            """
+            select task_id, space_id, kind, action, params, payload, status,
+                    retry_count, max_retries, next_run_ts, created_ts
+            from task where task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "task_id": row["task_id"],
+            "space_id": row["space_id"],
+            "kind": row["kind"],
+            "action": row["action"],
+            "params": json.loads(row["params"] or "{}"),
+            "payload": json.loads(row["payload"] or "{}"),
+            "status": row["status"],
+            "retry_count": int(row["retry_count"]),
+            "max_retries": int(row["max_retries"]),
+            "next_run_ts": int(row["next_run_ts"] or 0),
+            "created_ts": int(row["created_ts"] or 0),
+        }
+
+    def list(self, space_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        rows = self.db.conn().execute(
+            "select task_id, space_id, kind, action, status, retry_count from task"
+            " where space_id = ? order by created_ts desc limit ?",
+            (space_id, int(limit)),
+        ).fetchall()
+        return [
+            {"task_id": r["task_id"], "space_id": r["space_id"], "kind": r["kind"],
+             "action": r["action"], "status": r["status"], "retry_count": int(r["retry_count"])}
+            for r in rows
+        ]
+
+    def record(
+        self,
+        task_id: str,
+        status: str,
+        retry_count: int = 0,
+        next_run_ts: Optional[int] = None,
+        failure: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self.db.conn().execute(
+            """
+            update task set status = ?, retry_count = ?, failed_ts = ?,
+                next_run_ts = ? where task_id = ?
+            """,
+            (status, retry_count, failure, next_run_ts, task_id),
+        )
+        self.db.conn().commit()
+        return self.get(task_id)
+
+    def resume(self, task_id: str) -> Optional[Dict[str, Any]]:
+        row = self.get(task_id)
+        return row if row else None
+
+    def _new_id(self, prefix: str) -> str:
+        import random
+
+        return f"{prefix}_{random.randint(1000, 9999)}"
+
+    def _new_id_after(self, row: Dict[str, Any]) -> str:
+        return self._new_id("task")
+
+
+class StorylineStore:
+    """随时间变化的"故事线"：定期生成一条事件式记忆，写入记忆库。"""
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    def get(self, space_id: str) -> Optional[Dict[str, Any]]:
+        row = self.db.conn().execute(
+            "select storyline_id, events, last_update_ts, next_update_ts from long_run_state"
+            " where space_id = ? order by last_update_ts desc limit 1",
+            (space_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {"storyline_id": row["storyline_id"], "events": json.loads(row["events"] or "[]"),
+                "last_update_ts": int(row["last_update_ts"] or 0),
+                "next_update_ts": int(row["next_update_ts"] or 0)}
+
+    def generate(
+        self, space_id: str, interval_minutes: int, now: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
+        """生成一条故事线事件（模型不可用时走模板）。"""
+        now = int(now or __import__("time").time())
+        row = self.get(space_id)
+        if row is not None:
+            return row
+        interval = max(1, interval_minutes)
+        events: List[Dict[str, Any]] = [
+            {
+                "id": f"story_{now}",
+                "text": (
+                    f"{config_label(space_id)}的最近一次主动联系发生在今天 {now // 60:02d} 点，"
+                    f"随后选择了与「{theme_text(space_id) or '记忆库'}'相关的事来推进，"
+                    f"本轮故事线把这次选择记下来，作为后续主动联系的可复现起点。"
+                ),
+                "created_at": now,
+                "kind": "storyline",
+            }
+        ]
+        self.db.conn().execute(
+            """
+            insert into long_run_state (space_id, storyline_id, events, last_update_ts, next_update_ts, create_ts)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            (space_id, f"storyline_{now}", json.dumps(events, ensure_ascii=False), now, now + interval, now),
+        )
+        self.db.conn().commit()
+        return self.get(space_id)
+

@@ -314,6 +314,7 @@ class RetrievedMemory:
     :param experiences: 命中主题下挂载的经验片段
     :param rag_snippets: RAG 兜底检索结果
     :param rag_used: 本轮是否真的调用了 RAG
+    :param past_beliefs: 过去值（有效到今天之前的信念），用于回答"以前/曾经"类问题
     """
 
     kg_facts: List[str] = field(default_factory=list)
@@ -322,6 +323,8 @@ class RetrievedMemory:
     experiences: List[str] = field(default_factory=list)
     rag_snippets: List[str] = field(default_factory=list)
     rag_used: bool = False
+    past_beliefs: List[Dict[str, Any]] = field(default_factory=list)
+
 
     def to_prompt_block(self) -> str:
         """
@@ -364,5 +367,14 @@ class RetrievedMemory:
 
         if self.rag_snippets:
             blocks.append("【外部资料（RAG）】\n" + "\n".join(f"- {line}" for line in self.rag_snippets))
+
+        # 过去值：直接作为记忆区块的一部分，让 AI 回答"以前/曾经"类问题
+        if getattr(self, "past_beliefs", None):
+            lines = [
+                f"- 过去值：{b['head']} {b['rel']} {b['tail']}"
+                f"（状态 {b['status']}，有效到 {b['valid_to']}）"
+                for b in self.past_beliefs
+            ]
+            blocks.append("【过去值（以前/曾经）】\n" + "\n".join(lines))
 
         return "\n\n".join(blocks) if blocks else "（本轮没有召回到任何记忆）"

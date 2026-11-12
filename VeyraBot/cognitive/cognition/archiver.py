@@ -151,6 +151,30 @@ def _stable_id(*parts: str) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
 
 
+def _gate_relation(relation: Dict[str, Any]) -> bool:
+    """
+    高价值事实候选门禁（模块级纯函数）。
+
+    - 重要性达标（HIGH_IMPORTANCE）且涉及自我/本人 → 默认进入 candidate；
+    - 用户手动确认过的 → 保持生效，但仍算"已识别为高价值"；
+    - 只改写入参字典，不产生新记录。
+
+    :param relation: 抽取出的关系（含 head / tail / importance）
+    :return: 是否命中高价值门禁
+    """
+    importance = float(relation.get("importance") or 0.0)
+    self_involves = _mentions_self(relation.get("head")) or _mentions_self(
+        relation.get("tail")
+    )
+    if not (importance >= config.HIGH_IMPORTANCE or self_involves):
+        return False
+    if relation.get("user_confirmed"):
+        return True
+    relation["status"] = "candidate"
+    relation["is_active"] = 0
+    return True
+
+
 class MemoryArchiver:
     """记忆归档控制器。"""
 
@@ -354,6 +378,9 @@ class MemoryArchiver:
             )
             source_turn_id = source_turn_id or relation.get("source_turn_id") or ""
 
+            # 高价值事实候选门禁：在写库前改写状态（只改字典，不产生新记录）
+            gated = _gate_relation(relation)
+
             outcome = kg.upsert_relation(
                 KGRelation(
                     rid=_stable_id(space_id, head, relation["rel"], tail),
@@ -371,9 +398,12 @@ class MemoryArchiver:
                     valid_from=relation.get("valid_from", 0),
                     valid_to=relation.get("valid_to", 0),
                     user_confirmed=relation.get("user_confirmed", False),
+                    is_active=bool(relation.get("is_active", True)),
                 )
             )
             report["relations"] += 1
+            if gated:
+                report["gated"] = True
             for old_value, new_value in outcome["conflicts"]:
                 conflict_records.append(
                     f"{head} {relation['rel']}：{old_value} -> {new_value}"
@@ -477,6 +507,11 @@ class MemoryArchiver:
                     kind = "reconcile"
                 else:
                     kind = "reach_out"
+
+                # 断交表达开关（默认开）：关闭后关系状态照常记录，但不自动发断交声明
+                if kind == "severance" and not config.SEVERANCE_OPT_IN:
+                    report["severance_suppressed"] = True
+                    continue
 
                 content = self._compose_proactive_message(
                     kind=kind,

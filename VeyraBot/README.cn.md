@@ -645,11 +645,18 @@ cognitive-agent/
 | 没有主观体验 | 「自我」是可读、可写、可检索的信念数据 | 这是结构性模拟，不是意识 |
 | TF-IDF 检索 | 无外部依赖、可解释 | 替换 `VectorStore.add/search/count` 接入本地 embedding |
 | 主动联系依赖进程内线程 | 随 `python api/server.py` 提供；WSGI 部署需外部定时器 | 独立 worker 或任务队列 |
-| 记忆抽样可能重复 | 从最近 200 条主题/经验/信念中随机抽 | 记录近期用过的 `topic_id` 并短期排除 |
+| 记忆抽样可能重复 | 已加短期冷却窗口（`REMEMBER_COOLDOWN_MINUTES`）与话题关联加权，明显降低重复 | 仍属启发式；更长期的做法是记录"上次聊过什么"的日志 |
 | 好感度只影响提示词 | 关系温度会注入，但没有独立的冷热语气层 | 增加高/中/低表达层级 |
 | 抽取 JSON 可能截断 | 自动扩展预算 + 降级归档 | 流式增量 JSON 解析 |
 | 日结依赖计划任务 | 已提供 `install_schedule.ps1` | `StartWhenAvailable` 补跑漏掉的运行 |
 | 50 轮窗口受 token 限制 | 超过阈值后较早历史被压缩 | 使用长上下文模型时提高 `MAX_SAFE_TOKENS` |
+
+### 本次未做（后续计划）
+
+有两项**刻意留到后续**，写在这里避免被误认为已完成：
+
+1. **API 运行时联调。** `api/server.py` 能通过编译，也有离线测试覆盖，但本开发环境的系统 Python 没有安装 Flask，因此没有真正启动服务做端到端联调。对外提供前，请先在干净环境 `pip install -r requirements.txt`，再 `python api/server.py`，依次验证 `/api/health`、`/api/chat` 以及信念 / 人格 / 主动联系接口。
+2. **生产级后台任务。** 现在的 `task` 表 + `TaskStore` + `_run_tasks` 是可运行、可重试、可续跑的**进程内小版本**，不是独立 worker。多 worker 部署时应把调度与重试迁到独立 worker 或队列（Redis / Celery / RQ）；限流目前也是进程内滑动窗口，应迁到网关或共享存储。
 
 ---
 

@@ -44,6 +44,10 @@ class MemoryRouter:
         # ---------- 1. KG 精确查询 ----------
         kg = KGStore(self.db)
         result.kg_facts = kg.query_by_text(space_id, query)
+        # 过去值：用户问"以前/曾经"时，把历史偏好一并作为记忆区块入口
+        past = kg.query_past_beliefs(space_id, query)
+        if past:
+            result.past_beliefs = past
 
         # ---------- 2. 曾被推翻的旧信念 ----------
         # 只过滤不展示，会让 AI 感知不到"自己改过主意"（模型自己指出过这个漏洞）

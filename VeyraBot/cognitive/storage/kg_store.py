@@ -178,13 +178,15 @@ class KGStore:
                 coexisted = True
             else:
                 # 单值维度出现不同取值：旧信念被推翻
+                # 同时标记 superseded 并补 valid_to，让"以前/曾经"能命中旧值，
+                # 也让审计能区分"被取代"与"用户否决"。
                 connection.execute(
                     """
                     update kg_relation
-                    set is_active = 0, update_ts = ?
+                    set is_active = 0, status = 'superseded', valid_to = ?, update_ts = ?
                     where space_id = ? and rid = ?
                     """,
-                    (now, relation.space_id, row["rid"]),
+                    (now, now, relation.space_id, row["rid"]),
                 )
                 conflicts.append((row["tail_name"], relation.tail_name))
 
@@ -288,6 +290,136 @@ class KGStore:
             for row in rows
         ]
 
+    def query_by_text(
+        self,
+        space_id: str,
+        text: str,
+        limit: Optional[int] = None,
+    ) -> List[str]:
+        """
+        根据用户输入做信念查询（实体名包含匹配 + 过去值检索）。
+
+        这是"精确查询"而非向量相似：
+        - 用户提到实体名 → 精确按头/尾实体命中（含同义扩展）；
+        - 没有实体名匹配 → 回退到重要信念或"过去值"（见 query_past_beliefs）；
+        - 对"现在值/当前偏好"的查询，只返回当前有效信念（valid_to > now）；
+        - 对"以前/曾经/过去"的查询，返回过去值（valid_to <= now），
+          让"以前喜欢吃什么"能命中旧偏好，而不是被现在的值抢走。
+
+        :param space_id: 记忆空间
+        :param text: 用户输入文本
+        :param limit: 返回条数上限
+        :return: 可直接注入 Prompt 的事实文本行
+        """
+        past_cue = config.PAST_CUE_PATTERN.search(text or "")
+        if past_cue:
+            return [
+                self._format_fact(b)
+                for b in self.query_past_beliefs(space_id, text, limit)
+            ]
+
+        connection = self.db.conn()
+        limit = limit or config.KG_MAX_ROWS
+        now = int(time.time())
+
+        # 有效性过滤：只在"今天或将来"的信念里取值，过期/失效值不进当前回答
+        def _valid(b: Dict[str, Any]) -> bool:
+            return b.get("valid_to", 0) > now or b.get("is_active") is True
+
+        # 取出全部生效实体，用于在文本中做包含匹配
+        entities = connection.execute(
+            """
+            select e.name as name, e.etype as etype
+            from kg_entity as e
+            where e.space_id = ? and e.is_active = 1
+            """,
+            (space_id,),
+        ).fetchall()
+
+        matched_names = {row["name"] for row in entities if row["name"] and row["name"] in text}
+
+        # 用户提到实体名时，按实体精确查；否则回退到重要性最高的"自身核心信念"
+        rows: List[sqlite3.Row]
+        if matched_names:
+            placeholders = ",".join(["?"] * len(matched_names))
+            sql = f"""
+                select r.head_name as head_name, r.rel as rel, r.tail_name as tail_name,
+                        r.confidence as confidence, r.importance as importance
+                from kg_relation as r
+                where r.space_id = ? and r.is_active = 1
+                  and (r.head_name in ({placeholders}) or r.tail_name in ({placeholders}))
+                order by r.importance desc, r.confidence desc
+                limit ?
+            """
+            params = [space_id, *matched_names, *matched_names, limit]
+            rows = connection.execute(sql, params).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                select r.head_name as head_name, r.rel as rel, r.tail_name as tail_name,
+                        r.confidence as confidence, r.importance as importance
+                from kg_relation as r
+                where r.space_id = ? and r.is_active = 1
+                order by r.importance desc, r.confidence desc
+                limit ?
+                """,
+                (space_id, min(limit, 5)),
+            ).fetchall()
+
+        if not rows:
+            return []
+
+        # 相关性打分：实体名命中最高（1.0），关系名命中次之（0.8），
+        # 否则回退到重要性（0.6）。只有相关性够高才进 Prompt，避免无关事实污染回答。
+        def _relevance(row: sqlite3.Row) -> float:
+            text = f"{row['head_name'] or ''} {row['rel']} {row['tail_name']}"
+            if row["tail_name"] and row["tail_name"] in text:
+                return 1.0
+            if row["head_name"] and row["head_name"] in text:
+                return 0.9
+            if row["rel"] and any(k in text for k in (row["rel"], row["head_name"], row["tail_name"])):
+                return 0.6
+            return 0.0
+
+        scored: List[Tuple[str, float]] = []
+        for row in rows:
+            score = _relevance(row)
+            if score >= 0.5:
+                scored.append((row, score))
+
+        scored.sort(key=lambda item: item[1], reverse=True)
+        facts: List[str] = []
+        for row, score in scored:
+            facts.append(
+                f"{row['head_name']} {row['rel']} {row['tail_name']}"
+                f"（置信度 {float(row['confidence']):.2f}，重要性 {float(row['importance']):.2f}，"
+                f"相关度 {score:.2f}）"
+            )
+        return facts
+
+    def _format_fact(self, belief: Dict[str, Any]) -> str:
+        return (
+            f"{belief['head']} {belief['rel']} {belief['tail']}"
+            f"（置信度 {float(belief['confidence']):.2f}，重要性 {float(belief['importance']):.2f}，"
+            f"valid_from={belief['valid_from']}, valid_to={belief['valid_to']}, "
+            f"status={belief['status']}）"
+        )
+
+    def _current_tail(self, space_id: str, head_name: str, rel: str) -> str:
+        """取同头同关系的当前生效尾值（用于补"现在值"）。"""
+        connection = self.db.conn()
+        row = connection.execute(
+            """
+            select r.tail_name as tail_name
+            from kg_relation as r
+            where r.space_id = ? and r.head_name = ? and r.rel = ? and r.is_active = 1
+            order by r.update_ts desc
+            limit 1
+            """,
+            (space_id, head_name, rel),
+        ).fetchone()
+        return row["tail_name"] if row else ""
+
     def query_by_text(self, space_id: str, text: str, limit: Optional[int] = None) -> List[str]:
         """
         根据用户输入做信念查询（实体名包含匹配）。
@@ -348,6 +480,74 @@ class KGStore:
             f"（置信度 {float(row['confidence']):.2f}，重要性 {float(row['importance']):.2f}）"
             for row in rows
         ]
+
+    def query_past_beliefs(
+        self,
+        space_id: str,
+        text: str,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        查询"过去值"（有效到今天之前的信念）。
+
+        为什么要单独做：用户常问"以前/曾经/过去/上次"，检索必须能把
+        "现在偏好"与"过去偏好"分开：
+        - 现在值：valid_to > now（仍有效）
+        - 过去值：valid_to <= now 的生效值 + 被取代的 superseded 值
+        分开后，回答"以前喜欢吃什么"才能准确命中苹果，
+        而不是被"现在喜欢西瓜"抢走。
+
+        :param space_id: 记忆空间
+        :param text: 查询文本（用于相关性筛选）
+        :param limit: 返回条数上限
+        :return: [{"head","rel","tail","confidence","importance","status","valid_to","current"}]
+        """
+        if not config.PAST_CUE_PATTERN.search(text):
+            return []
+        if limit is None:
+            limit = config.OVERTURNED_MAX_ITEMS
+        connection = self.db.conn()
+
+        rows = connection.execute(
+            """
+            select r.head_name as head_name, r.rel as rel, r.tail_name as tail_name,
+                    r.confidence as confidence, r.importance as importance,
+                    r.status as status, r.valid_to as valid_to,
+                    r.is_active as is_active
+            from kg_relation as r
+            where r.space_id = ? and r.status in ('active', 'superseded')
+              and (r.is_active = 1 or r.status = 'superseded')
+            order by r.importance desc, r.confidence desc
+            limit ?
+            """,
+            (space_id, int(limit)),
+        ).fetchall()
+
+        now = int(time.time())
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            # 过去值：被取代的行，或已经到期（valid_to 在现在之前）的生效行；
+            # valid_to = 0 表示"仍然有效、没有到期"，不算过去值。
+            is_past = row["status"] == "superseded" or (
+                row["valid_to"] > 0 and row["valid_to"] <= now
+            )
+            if not is_past:
+                continue
+            current = self._current_tail(space_id, row["head_name"], row["rel"])
+            items.append(
+                {
+                    "head": row["head_name"] or "",
+                    "rel": row["rel"] or "",
+                    "tail": row["tail_name"] or "",
+                    "confidence": float(row["confidence"]),
+                    "importance": float(row["importance"]),
+                    "status": row["status"],
+                    "valid_to": int(row["valid_to"] or 0),
+                    "is_active": bool(row["is_active"]),
+                    "current": current or "",
+                }
+            )
+        return items
 
     def query_overturned(self, space_id: str, text: str = "", limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """

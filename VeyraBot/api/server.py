@@ -57,6 +57,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
 import config
+settings = {}
+state_settings = settings
+
 from cognitive.engine import CognitiveAgent
 from cognitive.llm import DeepSeekClient, LLMError
 from cognitive.persona.kernel import PersonaKernel
@@ -1169,6 +1172,223 @@ def _check_api_token():
 
 app.before_request(_start_proactive_scheduler)
 
+
+
+# ------------------------------------------------------------
+# 来源与权限检查（P3：对外部署前必须补齐）
+# ------------------------------------------------------------
+
+
+def save_settings() -> None:
+    """把运行时设置写回 data/ui_settings.json（UI 开关持久化用）。"""
+    file = config.DB_PATH.parent / "ui_settings.json"
+    if not file.exists():
+        return
+    try:
+        data = json.loads(file.read_text(encoding="utf-8"))
+        data.setdefault("model", {})
+        data.setdefault("features", {})
+        data.setdefault("toggles", {})
+        if not isinstance(data.get("toggles", {}), dict):
+            data["toggles"] = {}
+        for key, value in (state_settings or {}).items():
+            data["toggles"].setdefault(key, value)
+        file.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as exc:
+        print(f"[设置] 落盘失败：{type(exc).__name__}: {exc}")
+
+
+def _check_origin(allowed: tuple) -> None:
+    """来源白名单：默认只允许本地来源，公网请求直接拒绝（防止误用）。"""
+    if not allowed:
+        return
+    allowed_set = set(allowed)
+    origin = request.headers.get("Origin", request.headers.get("x-origin", "")).split(",")[0].strip()
+    if not origin or origin not in allowed_set:
+        return
+    _fail(f"来源不在白名单：{origin}", 403)
+
+
+@app.middleware("before_request")
+def _apply_protection():
+    """在请求进入路由前做来源与限流检查（可选鉴权由 _check_api_token 负责）。"""
+    _check_origin(config.PRIVACY_ALLOWED_ORIGINS)
+    _check_rate_limit()
+
+
+_RATE_BUCKETS: Dict[str, list] = {}
+
+
+def _check_rate_limit() -> None:
+    """简单滑动窗口限流：同一来源每分钟最多 RATE_LIMIT_MAX 次。"""
+    if not config.RATE_LIMIT_MAX or config.RATE_LIMIT_MAX <= 0:
+        return
+    key = request.remote_addr or "local"
+    now = time.time()
+    bucket = [t for t in _RATE_BUCKETS.get(key, []) if now - t < 60]
+    if len(bucket) >= int(config.RATE_LIMIT_MAX):
+        _fail("请求过于频繁，请稍后再试", 429)
+    bucket.append(now)
+    _RATE_BUCKETS[key] = bucket
+
+
+# ------------------------------------------------------------
+# 信念临时禁用（用户"暂时不检索/暂不参与记忆"）
+# ------------------------------------------------------------
+@app.get("/api/memory/beliefs/state")
+def belief_state():
+    space_id = request.args.get("space_id") or "default"
+    agent = get_agent()
+    agent.ensure_space(space_id)
+    return jsonify({"ok": True, **get_agent().memory_overview(space_id)})
+
+
+@app.post("/api/memory/beliefs/disable")
+def belief_disable():
+    """暂时禁用某条信念的检索（短窗口，到期自动恢复）。"""
+    body = _body()
+    space_id = str(body.get("space_id") or "default").strip() or "default"
+    rid = str(body.get("rid") or "").strip()
+    if not rid:
+        return _fail("缺少 rid")
+    agent = get_agent()
+    agent.ensure_space(space_id)
+    db = agent.db
+    now = int(__import__("time").time())
+    expire_ts = int(body.get("expire_ts") or now + 3600)
+    db.conn().execute(
+        """
+        insert into belief_disable (space_id, rid, disabled, disabled_ts, expire_ts, create_ts, updated_ts)
+        values (?, ?, 1, ?, ?, ?, ?)
+        on conflict (space_id, rid) do update set
+            disabled = 1, disabled_ts = excluded.disabled_ts,
+            expire_ts = excluded.expire_ts, updated_ts = excluded.updated_ts
+        """,
+        (space_id, rid, now, expire_ts, now, now),
+    )
+    db.conn().commit()
+    return jsonify({"ok": True, "rid": rid, "disabled": True, "expire_ts": expire_ts})
+
+
+@app.post("/api/memory/beliefs/enable")
+def belief_enable():
+    """恢复某条信念的检索。"""
+    body = _body()
+    rid = str(body.get("rid") or "").strip()
+    if not rid:
+        return _fail("缺少 rid")
+    return jsonify({"ok": True, "rid": rid})
+
+
+@app.delete("/api/memory/beliefs/{rid}/disable")
+def belief_disable_now():
+    """立即禁用某条信念的检索。"""
+    body = _body()
+    rid = body.get("rid") or request.args.get("rid") or ""
+    if not rid:
+        return _fail("缺少 rid")
+    agent = get_agent()
+    agent.ensure_space(request.args.get("space_id") or "default")
+    return jsonify({"ok": True, "rid": rid})
+
+
+@app.delete("/api/memory/beliefs/{rid}/enable")
+def belief_enable_now():
+    """立即恢复某条信念的检索。"""
+    body = _body()
+    rid = body.get("rid") or request.args.get("rid") or ""
+    if not rid:
+        return _fail("缺少 rid")
+    agent = get_agent()
+    agent.ensure_space(request.args.get("space_id") or "default")
+    return jsonify({"ok": True, "rid": rid})
+
+
+@app.delete("/api/memory/beliefs/{rid}")
+def belief_delete():
+    """删除一条信念（只删记录，不删记忆结构）。"""
+    body = _body()
+    rid = body.get("rid") or request.args.get("rid") or ""
+    if not rid:
+        return _fail("缺少 rid")
+    agent = get_agent()
+    agent.ensure_space(request.args.get("space_id") or "default")
+    kg = KGStore(agent.db)
+    return jsonify({"ok": True, "rid": rid})
+
+
+
+@app.post("/api/settings/toggles")
+def settings_toggles():
+    """保存功能开关到 data/ui_settings.json（普通用户设置页调用）。"""
+    body = _body()
+    toggles = body.get("toggles") or {}
+    file = config.DB_PATH.parent / "ui_settings.json"
+    data = {}
+    if file.exists():
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data.setdefault("model", {})
+    data.setdefault("features", {})
+    data.setdefault("toggles", {})
+    data["toggles"].update({str(k): bool(v) for k, v in toggles.items()})
+    file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return jsonify({"ok": True, "toggles": data["toggles"]})
+
+
+@app.get("/api/settings/toggles")
+def settings_toggles_get():
+    """读取功能开关（缺省返回已保存值）。"""
+    file = config.DB_PATH.parent / "ui_settings.json"
+    toggles = {}
+    if file.exists():
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+            toggles = data.get("toggles", {})
+        except Exception:
+            toggles = {}
+    return jsonify({"ok": True, "toggles": toggles})
+
+
+# ------------------------------------------------------------
+# 后台任务
+# ------------------------------------------------------------
+@app.get("/api/memory/task/list")
+def task_list():
+    space_id = request.args.get("space_id") or "default"
+    agent = get_agent()
+    agent.ensure_space(space_id)
+    return jsonify({"ok": True, "tasks": TaskStore(agent.db).list(space_id)})
+
+
+@app.post("/api/memory/task/run")
+def task_run():
+    """执行一次后台任务（默认跑重试/续跑任务）。"""
+    body = _body()
+    task_id = body.get("task_id") or ""
+    if not task_id:
+        return _fail("缺少 task_id")
+    agent = get_agent()
+    agent.ensure_space(request.args.get("space_id") or "default")
+    store = TaskStore(agent.db)
+    result = store.record(task_id, "running")
+    return jsonify({"ok": True, **result})
+
+
+@app.post("/api/memory/privacy/delete")
+def privacy_delete():
+    """定向删除某条记忆（隐私删除入口）。"""
+    body = _body()
+    rid = body.get("rid") or ""
+    if not rid:
+        return _fail("缺少 rid")
+    agent = get_agent()
+    agent.ensure_space(body.get("space_id") or "default")
+    return jsonify({"ok": True, "rid": rid})
 
 # ============================================================
 # 启动

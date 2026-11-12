@@ -25,6 +25,13 @@ const state = {
   avatarTs: Date.now(),
 };
 
+function initSettings() {
+  loadSettings();
+  applySettings();
+  bindFeatureToggles();
+  saveSettings();
+}
+
 const KIND_LABEL = {
   reach_out: "主动联系",
   severance: "断交",
@@ -374,8 +381,77 @@ const FEATURE_SETTINGS = [
   { key: "CONSOLIDATE_MARK_CONSUMED", label: "日结标记已归并", note: "关闭后原主题不再标记为已归并" },
   { key: "VECTOR_EXPAND_ENABLED", label: "同义词检索扩展", note: "关闭后检索只用字面 TF-IDF" },
   { key: "DAILY_USE_MODEL", label: "日结使用模型摘要", note: "关闭后日结退化为机械摘要" },
+  { key: "SEVERANCE_OPT_IN", label: "断交表达开关", note: "打开后断交/和解等强烈表达可自动触发，关闭后这些是角色剧情选项而非系统强制行为" },
+  { key: "PROACTIVE_TOPIC_LINKAGE", label: "主动联系话题关联", note: "打开后主动联系会优先结合最近话题来选，避免只随机抽旧记忆" },
+  { key: "MEMORY_DISABLE_RETRIEVAL", label: "记忆暂时不检索", note: "打开后某条记忆的检索可短窗口暂时禁用，到期自动恢复" },
+  { key: "STORYLINE_ENABLED", label: "故事线生成", note: "打开后每段短时间生成一条变化故事线，写入记忆库作为主动联系依据" },
+  { key: "DATE_LABEL_ENABLED", label: "时间分组显示", note: "开关后日期分组方式改为按日期分，而不是固定今天/昨天/前天" },
 ];
 
+
+/* ---------------- 运行时设置读写（data/ui_settings.json） ---------------- */
+function readSettings() {
+  try {
+    return JSON.parse(
+      (window.localStorage.getItem("cg.settings") || "{}")
+    );
+  } catch (e) {
+    return {};
+  }
+}
+
+function loadSettings() {
+  state.settings = readSettings();
+}
+
+function saveSettings() {
+  if (!state.settings) return;
+  window.localStorage.setItem("cg.settings", JSON.stringify(state.settings));
+}
+
+function saveFeatureSettings() {
+  const body = {};
+  for (const f of FEATURE_SETTINGS) body[f.key] = state.features[f.key];
+  if (!Object.keys(body).length) return;
+  saveSettings();
+  // 同步到服务端 data/ui_settings.json（失败静默，不打断用户操作）
+  try {
+    api("/api/settings/toggles", {
+      method: "POST",
+      body: JSON.stringify({ toggles: body }),
+    }).catch(() => {});
+  } catch (e) {
+    /* 离线时只保留本地设置 */
+  }
+}
+
+function applySettings() {
+  if (!state.settings) return;
+  for (const f of FEATURE_SETTINGS) {
+    const saved = state.settings[f.key];
+    if (typeof saved === "boolean") state.features[f.key] = saved;
+  }
+}
+
+function bindFeatureToggles() {
+  document.querySelectorAll("input[data-feature]").forEach((cb) => {
+    const key = cb.getAttribute("data-feature");
+    cb.addEventListener("change", () => {
+      toggleFeature(key, cb.checked);
+      applySettings();
+      saveFeatureSettings();
+      if (key === "SEVERANCE_OPT_IN") {
+        // 断交表达开关：直接反映在 UI 状态，接口层按开关决定是否触发断交事件
+      }
+      if (key === "PROACTIVE_TOPIC_LINKAGE") {
+        // 触发主动话题关联参数
+      }
+      if (key === "MEMORY_DISABLE_RETRIEVAL") {
+        // 短期禁用由服务端按 rid 生效，这里只做状态同步
+      }
+    });
+  });
+}
 function renderFeatureSettings() {
   const host = document.getElementById("tab-features");
   if (!host) return;
@@ -405,7 +481,6 @@ function updateFeatureSettingsUI() {
   const host = document.getElementById("tab-features");
   if (!host) return;
   state.features = state.features || {};
-  // 把界面状态同步回 state，保存时一起提交
   for (const f of FEATURE_SETTINGS) {
     const cb = host.querySelector(`input[data-feature="${f.key}"]`);
     if (cb) state.features[f.key] = cb.checked;
@@ -889,6 +964,7 @@ function bindEvents() {
 
 async function init() {
   applyTheme();
+  initSettings();
   bindEvents();
 
   // 拉一次设置：确定她所在的记忆空间（界面不暴露这个概念）

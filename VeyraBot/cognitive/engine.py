@@ -45,6 +45,7 @@ from cognitive.storage.affection_store import (
 from cognitive.storage.database import Database
 from cognitive.storage.kg_store import KGStore
 from cognitive.storage.topic_store import TopicStore
+from cognitive.storage.vector_store import VectorStore
 from cognitive.tools.base import ToolManager
 
 
@@ -164,6 +165,12 @@ class CognitiveAgent:
         """
         self.db.ensure_space(space_id, name)
         PersonaKernel(self.db, space_id).ensure_initialized()
+        # 故事线线程（P3 小规模版本）：只启动一次，后台按间隔生成
+        if not getattr(self, "_storyline_started", False):
+            self._storyline_started = True
+            threading.Thread(
+                target=self._start_storyline, name="storyline-thread", daemon=True
+            ).start()
 
     # ------------------------------------------------------------
     # 内部：装配空间相关的存储对象
@@ -261,8 +268,7 @@ class CognitiveAgent:
             "topics": len(memory.topics),
             "experiences": len(memory.experiences),
         }
-
-        # 记忆区块（人格变迁史会前置注入）
+        # 记忆区块（人格变迁史会前置注入；过去值已由 RetrievedMemory.to_prompt_block 渲染）
         memory_block = memory.to_prompt_block()
 
         # ---------- 步骤 6：自我溯源增强 ----------
@@ -303,6 +309,19 @@ class CognitiveAgent:
             memory_block = memory.to_prompt_block()
             if self._is_self_inquiry(user_message):
                 memory_block = f"{self_view_block}\n\n{memory_block}"
+
+        # ---------- 记忆规模上限：超过则停止向量召回并标记（避免内存膨胀拖慢运行） ----------
+        if (
+            len(memory.rag_snippets) >= config.MEMORY_MAX_VECTORS
+            or len(VectorStore(space_id)._docs) > config.MEMORY_CAP_NORMAL
+        ):
+            memory.rag_snippets = []
+            memory.rag_used = False
+            memory.capped = True
+            debug["memory_cap"] = {
+                "capped": True,
+                "vector_count": len(VectorStore(space_id)._docs),
+            }
 
         # ---------- 步骤 7b：关系温度注入 ----------
         # 放在所有 memory_block 重渲染路径之后，避免被 RAG 重新渲染覆盖。
@@ -436,6 +455,12 @@ class CognitiveAgent:
                 }
 
         debug["elapsed_ms"] = int((time.time() - started_at) * 1000)
+
+        # ---------- 步骤 12：后台任务续跑（重试/续跑/失败重试） ----------
+        try:
+            self._run_tasks(space_id)
+        except Exception as exc:
+            print(f"[任务续跑] 异常：{type(exc).__name__}: {exc}")
 
         # 主动消息（好感度阈值触发）挂到顶层，供 API / UI 直接取用，
         # 不必去 debug["archive"] 里翻
@@ -708,7 +733,7 @@ class CognitiveAgent:
 
         context = self.sessions.get_or_create(session, space_id)
         initiator = ProactiveInitiator(self.db, self.client)
-        memory = initiator.choose_memory(space_id)
+        memory = initiator.choose_memory(space_id, self._recent_context_for_prompt(context))
         if memory is None:
             # 记忆库还空着：不硬编空话，重新排一张表等有内容再说
             planned = self._plan_next_proactive(space_id, session, context)
@@ -866,6 +891,41 @@ class CognitiveAgent:
             + "\n".join(lines)
             + "\n（这些感受会影响你的语气与措辞；不要对用户报数字，也不要提及本区块。）"
         )
+
+    def _run_tasks(self, space_id: str = "default") -> None:
+        """后台执行可重试/可续跑的任务（归档、任务编排等），失败不影响主流程。"""
+        try:
+            from cognitive.storage.database import TaskStore
+
+            store = TaskStore(self.db)
+            for row in store.list(space_id, 500):
+                if row["status"] in ("pending", "running"):
+                    try:
+                        res = store.resume(row["task_id"])
+                        if res is None:
+                            continue
+                        store.record(row["task_id"], "running")
+                        store.record(row["task_id"], "done", retry_count=0,
+                                      next_run_ts=res.get("next_run_ts"))
+                    except Exception as exc:
+                        print(f"[任务续跑] 处理 {row['task_id']} 异常：{exc}")
+        except Exception as exc:
+            print(f"[任务续跑] 执行异常：{type(exc).__name__}: {exc}")
+
+    def _start_storyline(self) -> None:
+        """后台生成随时间变化的"故事线"（P3 小规模版本，仅在 PROACTIVE_ENABLED 时）。"""
+        from cognitive.storyline import StorylineStore
+
+        store = StorylineStore(self.db)
+        interval = config.STORYLINE_INTERVAL_MINUTES
+        while True:
+            time.sleep(max(1, int(interval)))
+            if not config.PROACTIVE_ENABLED:
+                continue
+            try:
+                store.generate(self.db.space_id, interval)
+            except Exception as exc:
+                print(f"[故事线] 生成异常：{type(exc).__name__}: {exc}")
 
     def long_run_state(self, space_id: str = "default") -> Dict[str, Any]:
         """

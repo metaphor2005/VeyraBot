@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -447,6 +448,41 @@ PERSONA_INITIAL_SELF_VIEW: str = (
 # 是否启用归档（关闭后仅保留短期上下文与兜底压缩）
 ENABLE_ARCHIVE: bool = get("ENABLE_ARCHIVE", "true").strip().lower() == "true"
 
+# 线索：以前/曾经/过去…（用于把"过去值"也纳入检索，回答"以前喜欢吃什么"）
+PAST_CUE_PATTERN = re.compile(r"以前|曾经|过去|上次|曾|从前|之前|以前说|以前说过")
+
+# 旧信念"以前说过"的线索：命中后把"过去值"也纳入召回（用于回答"以前/曾经/过去"）
+PAST_CUE_PATTERN = re.compile(
+    r"以前|曾经|过去|上次|曾|以前说|以前说过|过去说过|第一次|以前爱|以前喜欢|曾经喜欢|从前|之前"
+)
+
+# 影响身份/长期偏好、因此必须进入候选状态的高价值关系阈值（重要性）
+HIGH_IMPORTANCE: float = get_float("HIGH_IMPORTANCE", 0.85)
+
+# 高价值关系是否默认强制进入候选状态（用户确认后才生效；不是必须全部覆盖）
+CANDIDATE_GATE_ENABLED: bool = get("CANDIDATE_GATE_ENABLED", "true").strip().lower() == "true"
+
+# 记忆检索规模上限：超过该条数时停止向量召回并给出明确提示（防止索引膨胀）
+MEMORY_CAP_NORMAL: int = get_int("MEMORY_CAP_NORMAL", 800)
+
+# 主动联系：默认是否允许"断交等强烈表达"（开关，不写成专业术语）
+SEVERANCE_OPT_IN: bool = get("SEVERANCE_OPT_IN", "true").strip().lower() == "true"
+
+# 主动联系：随时间变化的"故事线"（间隔更新、写入记忆库）
+STORYLINE_INTERVAL_MINUTES: int = get_int("STORYLINE_INTERVAL_MINUTES", 60)
+
+# 主动联系：最近使用过的主题/记忆冷却窗口（避免重复抽到同一件事）
+REMEMBER_COOLDOWN_MINUTES: int = get_int("REMEMBER_COOLDOWN_MINUTES", 120)
+
+# 限流：单接口最大请求数（滑动窗口）
+RATE_LIMIT_MAX: int = get_int("RATE_LIMIT_MAX", 20)
+
+# 来源限制：允许访问的来源白名单（默认只允许本地来源）
+PRIVACY_ALLOWED_ORIGINS: tuple = tuple(get("PRIVACY_ALLOWED_ORIGINS", "127.0.0.1,localhost").split(","))
+
+# 记忆库最大向量条数（超限即停止向量召回并标记）
+MEMORY_MAX_VECTORS: int = get_int("MEMORY_MAX_VECTORS", 300)
+
 # 单轮最多入库的经验片段条数
 ARCHIVE_MAX_EXPERIENCES: int = get_int("ARCHIVE_MAX_EXPERIENCES", 5)
 
@@ -579,3 +615,35 @@ def validate_config() -> None:
 
 # 配置验证延迟到实际使用时执行
 # 这样可以避免在导入时立即失败，允许测试环境正常运行
+
+
+# ============================================================
+# 运行时开关落盘：data/ui_settings.json → config 全局覆盖
+# ============================================================
+def apply_runtime_toggles() -> None:
+    """
+    读取 data/ui_settings.json 里的 toggles，覆盖同名大写配置项。
+
+    为什么放在这里：设置页的开关由普通用户操作，不应该要求改 .env 或重启代码。
+    只在值存在时覆盖，缺失项保持 .env / 默认值。
+    """
+    import json
+
+    file = DB_PATH.parent / "ui_settings.json"
+    if not file.exists():
+        return
+    try:
+        data = json.loads(file.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    toggles = data.get("toggles") or {}
+    if not isinstance(toggles, dict):
+        return
+    for key, value in toggles.items():
+        if not isinstance(key, str) or not key.isupper():
+            continue
+        if key in globals():
+            globals()[key] = bool(value)
+
+
+apply_runtime_toggles()
