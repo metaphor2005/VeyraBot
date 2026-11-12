@@ -38,7 +38,6 @@ from cognitive.storage.topic_store import TopicStore
 from cognitive.storage.vector_store import VectorStore
 
 
-# 主动消息的模板降级文案（模型不可用时的兜底，保证阈值事件一定有消息可发）
 _PROACTIVE_TEMPLATES = {
     "reach_out": (
         "{person}，最近总觉得我们之间有点不对劲。是不是我哪里让你不舒服了？"
@@ -55,7 +54,6 @@ _PROACTIVE_TEMPLATES = {
 }
 
 
-# 把模型可能写出的"自己"的各种称呼，统一映射到人格实体名
 _SELF_ALIASES = ("我", "自己", "你", "本人", "本助手", "助手")
 
 
@@ -69,7 +67,10 @@ def _mentions_self(name: str) -> bool:
     return any(alias in text for alias in _SELF_ALIASES)
 
 
-def judge_big_event(relations: List[dict], user_text: str) -> Tuple[bool, str]:
+def _judge(
+    relations: List[dict],
+    user_message: str,
+) -> Tuple[bool, str]:
     """
     大事判定（纯函数，便于测试，不依赖模型）。
 
@@ -79,13 +80,13 @@ def judge_big_event(relations: List[dict], user_text: str) -> Tuple[bool, str]:
        若关掉 BIG_EVENT_REQUIRE_SELF，则退回纯阈值判定。
 
     :param relations: 抽取出的关系列表，每项含 head / tail / importance
-    :param user_text: 本轮用户消息
+    :param user_message: 本轮用户原话（显式传入，取代"回溯最后一条 user"）
     :return: (是否大事, 判定理由)
     """
     max_importance = max(
         (float(item.get("importance", 0.0)) for item in relations), default=0.0
     )
-    hint_hit = any(hint in (user_text or "") for hint in config.BIG_EVENT_HINTS)
+    hint_hit = any(hint in (user_message or "") for hint in config.BIG_EVENT_HINTS)
 
     self_related = any(
         _mentions_self(item.get("head")) or _mentions_self(item.get("tail"))
@@ -107,36 +108,36 @@ def judge_big_event(relations: List[dict], user_text: str) -> Tuple[bool, str]:
     return False, ""
 
 
-# 人格更新准入守卫：只有对话里出现"塑造自我"的迹象，才允许修改人格
-# 目的：防止模型把"回答风格"误判为"人格变化"，导致人格每轮剧变、快照爆炸
-_SELF_SHAPING_HINTS = (
-    "你应该",
-    "你可以",
-    "你是",
-    "你希望",
-    "你的性格",
-    "你的人格",
-    "你自己",
-    "你怎么看",
-    "你觉得",
-    "我希望你",
-    "我认为你",
-    "你怎么理解",
-    "你是谁",
-    "你不再是",
-    "你不只是",
-    "你的想法",
-    "你的价值",
-    "你的定位",
-    # 日常口语里"被说中性格"的说法（江妍这类人格设定下更常见的触发方式）
-    "被当成",
-    "在意别人",
-    "你其实",
-    "你老说",
-    "你怎么想",
-    "你的存在",
-    "你不是工具",
-)
+def _decide(relations: List[dict], user_message: str) -> Tuple[bool, str]:
+    """
+    对外稳定入口：真正执行规则，供引擎调用。
+
+    :param relations: 抽取出的关系列表，每项含 head / tail / importance
+    :param user_message: 本轮用户原话
+    :return: (是否大事, 判定理由)
+    """
+    return _judge(relations, user_message)
+
+
+def _is_big_event(relations: List[dict], user_message: str) -> bool:
+    return _decide(relations, user_message)[0]
+
+
+def _correction_action(relation: Dict[str, Any], user_confirmed: bool) -> str:
+    """
+    判断一条信念的用户侧动作，并给出可落地的纠正方式。
+
+    :param relation: 抽取出来的关系（含 source_type / user_confirmed）
+    :param user_confirmed: 用户是否手动确认过该信念
+    :return: 动作字符串；用户未主动确认时返回空串（交给 API 走推荐路径）
+    """
+    if relation.get("source_type") in ("user_stated", "user_confirmed"):
+        if user_confirmed:
+            return "confirm"
+        return "correct"
+    if relation.get("source_type") == "user_corrected":
+        return "correct"
+    return ""
 
 
 def _stable_id(*parts: str) -> str:
@@ -163,14 +164,21 @@ class MemoryArchiver:
         self.extractor = ArchiveExtractor(client)
         self.narrator = NarrativeGenerator(client)
 
-    # ------------------------------------------------------------
-    # 主入口
-    # ------------------------------------------------------------
-    def archive(self, context: SessionContext) -> Dict[str, Any]:
+    def archive(
+        self,
+        context: SessionContext,
+        user_message: str = "",
+        answer_parts: Optional[List[str]] = None,
+        turn_id: str = "",
+    ) -> Dict[str, Any]:
         """
         执行一次完整归档。
 
         :param context: 当前会话（取最后若干轮对话作为本轮）
+        :param user_message: 本轮用户原话（与 answer_parts 一起明确当前轮内容）
+        :param answer_parts: 本轮回答切分后的气泡列表；提供后按"用户 + 全部回复气泡"
+            构造本轮文本，避免从会话末尾消息位置猜测导致误标角色。
+        :param turn_id: 本轮 turn 标识（审计用）
         :return: 归档报告（用于终端观测与调试）
         """
         report: Dict[str, Any] = {
@@ -191,6 +199,11 @@ class MemoryArchiver:
             "changelog_entries": 0,
             "affection": [],
             "proactive_messages": [],
+            "corrections": [],
+            "duplicate": False,
+            "skipped": False,
+            "persona_frozen": False,
+            "turn_id": turn_id,
             "error": "",
         }
 
@@ -199,12 +212,29 @@ class MemoryArchiver:
             return report
 
         space_id = context.space_id
+        topics_store = TopicStore(self.db)
 
-        # ---------- 步骤 0：准备本轮文本 ----------
-        transcript = self._build_transcript(context)
+        # ---------- 步骤 0：准备本轮文本（显式传入，避免位置猜测误标角色） ----------
+        transcript = self._build_transcript(
+            context,
+            user_message=user_message,
+            answer_parts=answer_parts,
+            turn_id=turn_id,
+        )
         if not transcript:
             report["error"] = "本轮没有可归档的对话内容"
             return report
+
+        # ---------- 幂等保护：同一轮对话只沉淀一次 ----------
+        if turn_id:
+            topic = topics_store.get_topic_by_turn(space_id, turn_id)
+            if topic is not None:
+                report["ok"] = True
+                report["duplicate"] = True
+                report["skipped"] = True
+                report["topic_id"] = topic.topic_id
+                report["topic_title"] = topic.title
+                return report
 
         # ---------- 步骤 1：读取当前人格状态 ----------
         kernel = PersonaKernel(self.db, space_id)
@@ -233,7 +263,9 @@ class MemoryArchiver:
 
             # 降级归档：抽取模型不可用时，仍保存一条最小主题，
             # 保证这轮对话不会从记忆里彻底消失（后续可被召回）
-            fallback = self._save_fallback_topic(context, space_id, transcript)
+            fallback = self._save_fallback_topic(
+                context, space_id, transcript, turn_id, user_message
+            )
             if fallback is not None:
                 report["ok"] = True
                 report["degraded"] = True
@@ -251,6 +283,15 @@ class MemoryArchiver:
             extracted["persona_mood"] = None
             extracted["self_view_update"] = None
 
+        # 用户冻结人格后：事实/经验照常沉淀，但人格参数、情景与自我认知都不再变化。
+        # 这比"关掉归档"温和：记忆还在长大，只是她不再被对话改变。
+        persona_frozen = kernel.is_frozen()
+        report["persona_frozen"] = persona_frozen
+        if persona_frozen:
+            extracted["persona_deltas"] = {}
+            extracted["persona_mood"] = None
+            extracted["self_view_update"] = None
+
         # ---------- 步骤 3：写入主题记忆（事件级） ----------
         topic_data = extracted["topic"]
         topic = Topic(
@@ -261,6 +302,7 @@ class MemoryArchiver:
             keywords=topic_data["keywords"],
             session_id=context.session_id,
             snapshot_version=version_before,
+            turn_id=turn_id,
         )
         topics_store.save_topic(topic)
 
@@ -299,6 +341,19 @@ class MemoryArchiver:
             head = self._normalize_self_name(relation["head"])
             tail = self._normalize_self_name(relation["tail"])
 
+            # 溯源字段：显式来源 + 状态（P1）。
+            # 用户明确说过 → user_stated；模型推断 → model_inferred；
+            # 用户手动纠正 → user_corrected；人格前史 → seed。
+            source_turn_id = relation.get("turn_id") or ""
+            source_type = (
+                "user_stated"
+                if relation.get("source_type") in ("user_stated", "user_confirmed")
+                else "user_corrected"
+                if relation.get("source_type") == "user_corrected"
+                else "model_inferred"
+            )
+            source_turn_id = source_turn_id or relation.get("source_turn_id") or ""
+
             outcome = kg.upsert_relation(
                 KGRelation(
                     rid=_stable_id(space_id, head, relation["rel"], tail),
@@ -310,6 +365,12 @@ class MemoryArchiver:
                     importance=relation["importance"],
                     multi_valued=bool(relation.get("multi")),
                     source_topic_id=topic.topic_id,
+                    source_turn_id=source_turn_id,
+                    source_type=source_type,
+                    status=relation.get("status", "active"),
+                    valid_from=relation.get("valid_from", 0),
+                    valid_to=relation.get("valid_to", 0),
+                    user_confirmed=relation.get("user_confirmed", False),
                 )
             )
             report["relations"] += 1
@@ -353,6 +414,23 @@ class MemoryArchiver:
                         )
                     )
                     report["changelog_entries"] += 1
+                    # 用户主动纠正/确认的信念也留账，便于回滚与审计
+                    user_confirmed = bool(relation.get("user_confirmed", False))
+                    correction_action = self._correction_action(relation, user_confirmed)
+                    if correction_action:
+                        report["corrections"] = self._append_correction(
+                            space_id,
+                            correction_action,
+                            relation={
+                                "rid": _stable_id(
+                                    space_id, head, relation["rel"], tail
+                                ),
+                                "head_name": head,
+                                "rel": relation["rel"],
+                                "old_tail": "",
+                                "new_tail": tail,
+                            },
+                        )
 
         # ---------- 步骤 4b：好感度演化与主动消息 ----------
         # 好感度不属于"人格"（人格必须缓慢演化），属于对具体人的情感温度，
@@ -511,8 +589,8 @@ class MemoryArchiver:
                 user_text = msg.content or ""
                 break
 
-        report["is_big_event"], report["big_event_reason"] = judge_big_event(
-            extracted["relations"], user_text
+        report["is_big_event"], report["big_event_reason"] = _decide(
+            extracted["relations"], user_message
         )
 
         if report["is_big_event"]:
@@ -520,6 +598,182 @@ class MemoryArchiver:
 
         report["ok"] = True
         return report
+
+    # ------------------------------------------------------------
+    # 工具方法
+    # ------------------------------------------------------------
+    def _create_topic(
+        self,
+        space_id: str,
+        transcript: str,
+        context: SessionContext,
+        report: Dict[str, Any],
+    ) -> Topic:
+        """
+        写入主题记忆（事件级）。
+
+        :param space_id: 记忆空间
+        :param transcript: 本轮对话文本
+        :param context: 当前会话（取 session_id 作为主题挂载）
+        :param report: 归档报告（写入 topic_id 等字段）
+        :return: 主题对象
+        """
+        topic_id = report.get("turn_id") or new_id("topic")
+        topic = Topic(
+            topic_id=topic_id,
+            space_id=space_id,
+            title=transcript.strip().replace("\n", " ")[:24],
+            abstract=transcript[:400],
+            keywords=[],
+            session_id=context.session_id,
+            snapshot_version=0,
+        )
+        topics_store = TopicStore(self.db)
+        topics_store.save_topic(topic)
+        report["topic_id"] = topic.topic_id
+        report["topic_title"] = topic.title
+        return topic
+
+    def _build_transcript(
+        self,
+        context: SessionContext,
+        user_message: str = "",
+        answer_parts: Optional[List[str]] = None,
+        turn_id: str = "",
+    ) -> str:
+        """
+        构造"本轮对话"的文本，用于抽取。
+
+        取值优先级（越靠前越可靠）：
+        1. 显式传入的 user_message + answer_parts —— 引擎知道本轮的准确边界；
+        2. 按 turn_id 从会话里回溯同一轮的所有消息；
+        3. 兜底：按位置猜测（最后一条 user + 最后一条 assistant）。
+
+        为什么必须显式传参（历史 bug）：
+        回复会被切成多个气泡入库（"她连发几条"），于是会话末尾往往是
+        [user, assistant, assistant, ...]。按位置取"最后两条"会把上一条
+        assistant 气泡当成 user，抽取出来的"用户说了什么"完全是错的。
+        显式传入本轮的用户原话与全部回复气泡，才能保证抽取输入正确。
+
+        :param context: 会话对象
+        :param user_message: 本轮用户原话
+        :param answer_parts: 本轮回复的气泡列表
+        :param turn_id: 本轮标识
+        :return: 对话文本（形如 "user: ...\\nassistant: ..."）
+        """
+        # 1) 显式传入（最可靠）
+        if user_message or answer_parts:
+            lines: List[str] = []
+            if user_message:
+                lines.append(f"user: {user_message}")
+            for part in answer_parts or []:
+                if part:
+                    lines.append(f"assistant: {part}")
+            if lines:
+                return "\n".join(lines)
+
+        messages = context.messages
+        if not messages:
+            return ""
+
+        # 2) 按 turn_id 回溯本轮全部消息
+        if turn_id:
+            turn_messages = [m for m in messages if m.turn_id == turn_id]
+            if turn_messages:
+                return "\n".join(
+                    f"{m.role}: {m.content}" for m in turn_messages if m.content
+                )
+
+        # 3) 位置兜底：找最后一条 user 与它之后的第一条 assistant。
+        last_user_index = -1
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index].role == "user" and messages[index].content:
+                last_user_index = index
+                break
+
+        if last_user_index < 0:
+            return ""
+
+        assistant_index = -1
+        for index in range(last_user_index + 1, len(messages)):
+            if messages[index].role == "assistant" and messages[index].content:
+                assistant_index = index
+                break
+
+        if assistant_index < 0:
+            return ""
+
+        return "\n".join(
+            [
+                f"user: {messages[last_user_index].content}",
+                f"assistant: {messages[assistant_index].content}",
+            ]
+        )
+
+    @staticmethod
+    def _normalize_self_name(name: str) -> str:
+        """
+        把指代"自己"的各种说法统一为人格实体名，保证图谱节点不分裂。
+
+        :param name: 原始名称
+        :return: 规范化名称
+        """
+        clean = (name or "").strip()
+        if clean in _SELF_ALIASES or clean.startswith("认知体"):
+            return config.PERSONA_NAME
+        return clean
+
+    @staticmethod
+    def _persona_update_allowed(transcript: str) -> bool:
+        """
+        判断本轮是否允许修改人格。
+
+        判定标准：对话中出现"对自我的讨论或塑造"，例如"你希望""你觉得""你的定位"。
+
+        :param transcript: 本轮完整对话
+        :return: 是否允许
+        """
+        return any(hint in transcript for hint in _SELF_SHAPING_HINTS)
+
+    # ------------------------------------------------------------
+    # 用户纠正 / 确认（P1）
+    # ------------------------------------------------------------
+    @staticmethod
+    def _correction_action(relation: Dict[str, Any], user_confirmed: bool) -> str:
+        """
+        判断一条信念的用户侧动作，并给出可落地的纠正方式。
+
+        :param relation: 抽取出来的关系（含 source_type / user_confirmed）
+        :param user_confirmed: 用户是否手动确认过该信念
+        :return: 动作字符串；用户未主动确认时返回空串
+        """
+        if relation.get("source_type") in ("user_stated", "user_confirmed"):
+            if user_confirmed:
+                return "confirm"
+            return "correct"
+        if relation.get("source_type") == "user_corrected":
+            return "correct"
+        return ""
+
+    def _append_correction(
+        self,
+        space_id: str,
+        action: str,
+        note: str = "",
+        relation: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        把用户纠正/确认写入信念纠正审计表（委托给 KGStore）。
+
+        :param space_id: 记忆空间
+        :param action: confirm / correct / reject
+        :param note: 用户备注
+        :param relation: 相关信念信息
+        :return: 写入的记录列表
+        """
+        return KGStore(self.db)._append_correction(
+            space_id, action, note, relation
+        )
 
     def _compose_proactive_message(
         self,
@@ -565,11 +819,13 @@ class MemoryArchiver:
         template = _PROACTIVE_TEMPLATES.get(kind) or _PROACTIVE_TEMPLATES["reach_out"]
         return template.format(person=person)
 
-    # ------------------------------------------------------------
-    # 工具方法
-    # ------------------------------------------------------------
     def _save_fallback_topic(
-        self, context: SessionContext, space_id: str, transcript: str
+        self,
+        context: SessionContext,
+        space_id: str,
+        transcript: str,
+        turn_id: str = "",
+        user_message: str = "",
     ) -> Optional[Topic]:
         """
         抽取失败时的降级归档：只保存一条最小主题，保证记忆链不断。
@@ -577,15 +833,20 @@ class MemoryArchiver:
         :param context: 会话对象
         :param space_id: 记忆空间
         :param transcript: 本轮对话文本
+        :param turn_id: 本轮标识（写入主题，保证幂等与溯源）
+        :param user_message: 本轮用户原话（优先作为标题来源）
         :return: 生成的主题对象；失败返回 None
         """
         try:
-            # 取最后一条用户消息作为标题来源
-            user_text = ""
-            for msg in reversed(context.messages):
-                if msg.role == "user" and msg.content:
-                    user_text = msg.content
-                    break
+            # 优先用显式传入的用户原话作为标题来源
+            user_text = user_message
+            if not user_text:
+                for msg in reversed(context.messages):
+                    role = getattr(msg, "role", "")
+                    content = getattr(msg, "content", "")
+                    if role == "user" and content:
+                        user_text = content
+                        break
 
             if not user_text:
                 return None
@@ -599,6 +860,7 @@ class MemoryArchiver:
                 keywords=[],
                 session_id=context.session_id,
                 snapshot_version=PersonaKernel(self.db, space_id).get_current_version(),
+                turn_id=turn_id,
             )
 
             TopicStore(self.db).save_topic(topic)
@@ -616,54 +878,45 @@ class MemoryArchiver:
             # 降级本身失败不影响主流程
             return None
 
-    @staticmethod
-    def _build_transcript(context: SessionContext) -> str:
-        """
-        取出本轮对话文本（最后一条 user + 最后一条 assistant）。
 
-        :param context: 会话对象
-        :return: 对话文本
-        """
-        messages = context.messages
-        if not messages:
-            return ""
+def judge_big_event(
+    relations: List[dict],
+    user_message: str = "",
+    user_text: str = "",
+) -> Tuple[bool, str]:
+    """
+    大事判定（纯函数，便于测试，不依赖模型）。
 
-        # 找到最后一条 assistant，回溯一条 user
-        end_index = len(messages) - 1
-        if messages[end_index].role != "assistant":
-            return ""
+    规则：
+    1. 用户消息命中长期指令词 → 大事；
+    2. 某条信念 importance ≥ BIG_EVENT_IMPORTANCE 且关系头/尾是她 → 大事；
+       若关掉 BIG_EVENT_REQUIRE_SELF，则退回纯阈值判定。
 
-        start_index = end_index - 1
-        if start_index < 0:
-            return ""
+    :param relations: 抽取出的关系列表，每项含 head / tail / importance
+    :param user_message: 本轮用户原话（显式传入）
+    :param user_text: 由调用方注入，保留兼容
+    :return: (是否大事, 判定理由)
+    """
+    max_importance = max(
+        (float(item.get("importance", 0.0)) for item in relations), default=0.0
+    )
+    hint_hit = any(hint in (user_message or "") for hint in config.BIG_EVENT_HINTS)
 
-        lines = [
-            f"user: {messages[start_index].content}",
-            f"assistant: {messages[end_index].content}",
-        ]
-        return "\n".join(lines)
+    self_related = any(
+        _mentions_self(item.get("head")) or _mentions_self(item.get("tail"))
+        for item in relations
+    )
+    by_importance = max_importance >= config.BIG_EVENT_IMPORTANCE and (
+        self_related or not config.BIG_EVENT_REQUIRE_SELF
+    )
 
-    @staticmethod
-    def _normalize_self_name(name: str) -> str:
-        """
-        把指代"自己"的各种说法统一为人格实体名，保证图谱节点不分裂。
-
-        :param name: 原始名称
-        :return: 规范化名称
-        """
-        clean = (name or "").strip()
-        if clean in _SELF_ALIASES or clean.startswith("认知体"):
-            return config.PERSONA_NAME
-        return clean
-
-    @staticmethod
-    def _persona_update_allowed(transcript: str) -> bool:
-        """
-        判断本轮是否允许修改人格。
-
-        判定标准：对话中出现"对自我的讨论或塑造"，例如"你希望""你觉得""你的定位"。
-
-        :param transcript: 本轮完整对话
-        :return: 是否允许
-        """
-        return any(hint in transcript for hint in _SELF_SHAPING_HINTS)
+    if hint_hit:
+        return True, "命中长期指令词"
+    if by_importance:
+        reason = (
+            f"importance={max_importance:.2f} ≥ {config.BIG_EVENT_IMPORTANCE}，且涉及自身定位"
+            if config.BIG_EVENT_REQUIRE_SELF
+            else f"importance={max_importance:.2f} ≥ {config.BIG_EVENT_IMPORTANCE}"
+        )
+        return True, reason
+    return False, ""

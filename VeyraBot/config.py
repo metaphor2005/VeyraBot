@@ -364,6 +364,16 @@ API_HOST: str = get("API_HOST", "127.0.0.1")
 # HTTP API 端口
 API_PORT: int = get_int("API_PORT", 8000)
 
+# 可选 API 令牌：留空表示不鉴权（默认只监听 127.0.0.1）。
+# 对外暴露时务必设置，并在请求头带 X-API-Token（或 ?token=）。
+API_TOKEN: str = get("API_TOKEN", "").strip()
+
+# 主动联系默认偏好（可在 Web UI「功能」/ 开发者接口按空间覆盖）
+PROACTIVE_DND_START: int = get_int("PROACTIVE_DND_START", 23)
+PROACTIVE_DND_END: int = get_int("PROACTIVE_DND_END", 8)
+PROACTIVE_DAILY_CAP: int = get_int("PROACTIVE_DAILY_CAP", 3)
+PROACTIVE_COOLDOWN_MINUTES: int = get_int("PROACTIVE_COOLDOWN_MINUTES", 60)
+
 # 关键参数集合：这些参数即使变化较小，也视为对自我认知有实质影响
 PERSONA_CORE_PARAMS: Tuple[str, ...] = (
     "prefer_skepticism",

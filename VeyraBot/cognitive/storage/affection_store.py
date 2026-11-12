@@ -506,6 +506,26 @@ class ProactiveScheduleStore:
         connection.commit()
         return cursor.rowcount > 0
 
+    def skip(self, space_id: str, session_id: str) -> bool:
+        """
+        把当前待兑现的时间表标记为跳过（"这轮先别发"）。
+
+        :param space_id: 记忆空间
+        :param session_id: 会话 id
+        :return: 是否真的跳过了一张 pending 时间表
+        """
+        connection = self.db.conn()
+        cursor = connection.execute(
+            """
+            update proactive_schedule
+            set status = 'skipped', update_ts = ?
+            where space_id = ? and session_id = ? and status = 'pending'
+            """,
+            (int(time.time()), space_id, session_id),
+        )
+        connection.commit()
+        return cursor.rowcount > 0
+
     def claim(self, space_id: str, session_id: str, due_ts: int) -> bool:
         """
         原子兑现时间表：只有"仍 pending 且 due_ts 未被覆盖"时才成功。
@@ -531,3 +551,201 @@ class ProactiveScheduleStore:
         )
         connection.commit()
         return cursor.rowcount > 0
+
+
+class ProactivePolicyStore:
+    """主动联系的用户偏好：免打扰时段、每日上限、冷却、跳过本轮。"""
+
+    DEFAULT_DND_START = config.PROACTIVE_DND_START
+    DEFAULT_DND_END = config.PROACTIVE_DND_END
+    DEFAULT_DAILY_CAP = config.PROACTIVE_DAILY_CAP
+    DEFAULT_COOLDOWN_MINUTES = config.PROACTIVE_COOLDOWN_MINUTES
+
+    def __init__(self, db: Database) -> None:
+        """
+        :param db: 数据库访问对象
+        """
+        self.db = db
+
+    def get(self, space_id: str) -> Dict[str, Any]:
+        """
+        读取策略（不存在时返回默认值，不写库）。
+
+        :param space_id: 记忆空间
+        :return: 策略字典
+        """
+        connection = self.db.conn()
+        row = connection.execute(
+            """
+            select dnd_start, dnd_end, daily_cap, cooldown_minutes, skip_next
+            from proactive_policy
+            where space_id = ?
+            """,
+            (space_id,),
+        ).fetchone()
+        if not row:
+            return {
+                "space_id": space_id,
+                "dnd_start": self.DEFAULT_DND_START,
+                "dnd_end": self.DEFAULT_DND_END,
+                "daily_cap": self.DEFAULT_DAILY_CAP,
+                "cooldown_minutes": self.DEFAULT_COOLDOWN_MINUTES,
+                "skip_next": False,
+            }
+        return {
+            "space_id": space_id,
+            "dnd_start": int(row["dnd_start"]),
+            "dnd_end": int(row["dnd_end"]),
+            "daily_cap": int(row["daily_cap"]),
+            "cooldown_minutes": int(row["cooldown_minutes"]),
+            "skip_next": bool(row["skip_next"]),
+        }
+
+    def update(
+        self,
+        space_id: str,
+        dnd_start: Optional[int] = None,
+        dnd_end: Optional[int] = None,
+        daily_cap: Optional[int] = None,
+        cooldown_minutes: Optional[int] = None,
+        skip_next: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """
+        写入策略（未提供的字段保持不变）。
+
+        :param space_id: 记忆空间
+        :param dnd_start/dnd_end: 免打扰时段（0~23）
+        :param daily_cap: 每日主动消息上限
+        :param cooldown_minutes: 两次主动消息之间的最短间隔
+        :param skip_next: 是否跳过下一轮
+        :return: 更新后的策略
+        """
+        current = self.get(space_id)
+        now = int(time.time())
+        connection = self.db.conn()
+        connection.execute(
+            """
+            insert into proactive_policy
+                (space_id, dnd_start, dnd_end, daily_cap, cooldown_minutes,
+                 skip_next, create_ts, update_ts)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict (space_id) do update set
+                dnd_start = excluded.dnd_start,
+                dnd_end = excluded.dnd_end,
+                daily_cap = excluded.daily_cap,
+                cooldown_minutes = excluded.cooldown_minutes,
+                skip_next = excluded.skip_next,
+                update_ts = excluded.update_ts
+            """,
+            (
+                space_id,
+                int(current["dnd_start"] if dnd_start is None else dnd_start),
+                int(current["dnd_end"] if dnd_end is None else dnd_end),
+                max(0, int(current["daily_cap"] if daily_cap is None else daily_cap)),
+                max(
+                    0,
+                    int(
+                        current["cooldown_minutes"]
+                        if cooldown_minutes is None
+                        else cooldown_minutes
+                    ),
+                ),
+                1
+                if (current["skip_next"] if skip_next is None else skip_next)
+                else 0,
+                now,
+                now,
+            ),
+        )
+        connection.commit()
+        return self.get(space_id)
+
+    def consume_skip(self, space_id: str) -> bool:
+        """
+        消费一次"这轮先别发"。
+
+        :param space_id: 记忆空间
+        :return: 本次是否真的跳过了
+        """
+        policy = self.get(space_id)
+        if not policy["skip_next"]:
+            return False
+        self.update(space_id, skip_next=False)
+        return True
+
+    @staticmethod
+    def in_dnd(policy: Dict[str, Any], now: Optional[int] = None) -> bool:
+        """
+        判断当前是否落在免打扰时段（支持跨午夜，如 23 点到次日 8 点）。
+
+        :param policy: 策略字典
+        :param now: 时间戳（缺省当前）
+        :return: 是否免打扰
+        """
+        hour = time.localtime(now or time.time()).tm_hour
+        start = int(policy.get("dnd_start", 23))
+        end = int(policy.get("dnd_end", 8))
+        if start == end:
+            return False
+        if start < end:
+            return start <= hour < end
+        return hour >= start or hour < end
+
+    def sent_today(self, space_id: str) -> int:
+        """
+        统计今天已发送的主动消息条数（按自然日）。
+
+        :param space_id: 记忆空间
+        :return: 条数
+        """
+        local = time.localtime()
+        start = int(
+            time.mktime(
+                (local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, 0, 0, -1)
+            )
+        )
+        connection = self.db.conn()
+        row = connection.execute(
+            "select count(1) as cnt from proactive_message"
+            " where space_id = ? and create_ts >= ?",
+            (space_id, start),
+        ).fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def last_sent_ts(self, space_id: str) -> int:
+        """
+        最近一条主动消息的发送时间。
+
+        :param space_id: 记忆空间
+        :return: 时间戳；从未发送返回 0
+        """
+        connection = self.db.conn()
+        row = connection.execute(
+            "select max(create_ts) as ts from proactive_message where space_id = ?",
+            (space_id,),
+        ).fetchone()
+        return int(row["ts"]) if row and row["ts"] else 0
+
+    def block_reason(self, space_id: str, now: Optional[int] = None) -> str:
+        """
+        给出当前应阻止主动联系的原因（空串表示可以发）。
+
+        :param space_id: 记忆空间
+        :param now: 时间戳（缺省当前）
+        :return: 阻止原因：dnd / daily_cap / cooldown / skip_next / 空串
+        """
+        policy = self.get(space_id)
+        if policy["skip_next"]:
+            return "skip_next"
+        if self.in_dnd(policy, now):
+            return "dnd"
+        if policy["daily_cap"] > 0 and self.sent_today(
+            space_id
+        ) >= policy["daily_cap"]:
+            return "daily_cap"
+        cooldown = int(policy["cooldown_minutes"]) * 60
+        if cooldown > 0:
+            last = self.last_sent_ts(space_id)
+            if last and int(now or time.time()) - last < cooldown:
+                return "cooldown"
+        return ""

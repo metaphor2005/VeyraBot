@@ -127,6 +127,7 @@ def seed_persona(db: Database, space_id: str, space_name: str = "") -> Dict[str,
                 confidence=0.85,
                 importance=importance,
                 source_topic_id="",
+                source_type="seed",
             )
         )
         stats["relations"] += 1

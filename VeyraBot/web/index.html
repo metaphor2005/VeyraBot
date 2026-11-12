@@ -88,6 +88,9 @@
       <div class="modal-body">
         <nav class="modal-nav">
           <div class="modal-nav-item active" data-tab="general">通用</div>
+          <div class="modal-nav-item" data-tab="features">功能</div>
+          <div class="modal-nav-item" data-tab="memory">记忆</div>
+          <div class="modal-nav-item" data-tab="persona">人格</div>
           <div class="modal-nav-item" data-tab="model">模型连接</div>
           <div class="modal-nav-item" data-tab="profile">个人</div>
         </nav>
@@ -149,11 +152,73 @@
             </div>
             <p class="setting-note">支持 PNG / JPG / WebP / GIF，不超过 2MB。这张头像会显示在你的消息旁边。</p>
           </section>
+
+          <!-- 功能开关（由 app.js 渲染） -->
+          <section id="tab-features" class="hidden">
+            <div class="setting-note">可在设置窗口「功能」页开启或关闭各项能力。</div>
+          </section>
+
+          <!-- 记忆：信念自查与纠正 -->
+          <section id="tab-memory" class="hidden">
+            <div class="setting-row">
+              <div class="setting-label grow">她记住的事</div>
+              <button id="beliefRefreshBtn" class="btn-secondary">刷新</button>
+            </div>
+            <div id="beliefList" class="belief-list">
+              <p class="setting-note">正在读取……</p>
+            </div>
+            <p class="setting-note">
+              「确认」表示这条是对的；「纠正」会把它标为待验证；「否决」会停用这条记忆。
+              被否决的记忆不会立刻删除，方便以后回看。
+            </p>
+          </section>
+
+          <!-- 人格：冻结 / 回退 / 主动联系偏好 -->
+          <section id="tab-persona" class="hidden">
+            <div class="setting-row">
+              <div class="setting-label grow">冻结人格</div>
+              <label class="switch">
+                <input type="checkbox" id="personaFrozenSwitch">
+                <span class="slider"></span>
+              </label>
+            </div>
+            <p class="setting-note">冻结后她仍会记事，但性格、情绪和自我认知不再改变。</p>
+
+            <div class="setting-row">
+              <div class="setting-label grow">人格状态</div>
+              <button id="personaResetBtn" class="btn-secondary">回到最初</button>
+            </div>
+            <div id="personaSummary" class="setting-note">正在读取……</div>
+            <p class="setting-note">「回到最初」只重置性格倾向，不会删除她的记忆和往事。</p>
+
+            <div class="setting-divider"></div>
+            <div class="setting-row"><div class="setting-label grow">主动联系</div></div>
+            <div class="setting-row">
+              <label class="setting-label" for="dndStartInput">免打扰开始</label>
+              <input id="dndStartInput" type="text" inputmode="numeric" placeholder="23">
+              <label class="setting-label" for="dndEndInput">结束</label>
+              <input id="dndEndInput" type="text" inputmode="numeric" placeholder="8">
+            </div>
+            <div class="setting-row">
+              <label class="setting-label" for="dailyCapInput">每日上限</label>
+              <input id="dailyCapInput" type="text" inputmode="numeric" placeholder="3">
+              <label class="setting-label" for="cooldownInput">最短间隔（分钟）</label>
+              <input id="cooldownInput" type="text" inputmode="numeric" placeholder="60">
+            </div>
+            <div class="setting-actions">
+              <button id="savePolicyBtn" class="btn-primary">保存</button>
+              <button id="skipNextBtn" class="btn-secondary">这轮先别发</button>
+            </div>
+            <div id="policyStatus" class="setting-status"></div>
+
+            <div id="affectionSection" class="setting-divider hidden"></div>
+            <div id="affectionList" class="belief-list"></div>
+          </section>
         </div>
       </div>
     </div>
   </div>
 
-  <script src="app.js?v=20261112a"></script>
+  <script src="app.js?v=20261114"></script>
 </body>
 </html>

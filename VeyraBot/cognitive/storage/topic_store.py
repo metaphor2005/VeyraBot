@@ -41,15 +41,16 @@ class TopicStore:
             """
             insert into topic
                 (space_id, topic_id, title, abstract, keywords, session_id,
-                 snapshot_version, kind, consolidated, is_big_event, create_ts)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 snapshot_version, kind, consolidated, is_big_event, turn_id, create_ts)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict (space_id, topic_id) do update set
                 title = excluded.title,
                 abstract = excluded.abstract,
                 keywords = excluded.keywords,
                 snapshot_version = excluded.snapshot_version,
                 kind = excluded.kind,
-                is_big_event = excluded.is_big_event
+                is_big_event = excluded.is_big_event,
+                turn_id = excluded.turn_id
             """,
             (
                 topic.space_id,
@@ -62,6 +63,7 @@ class TopicStore:
                 topic.kind,
                 1 if topic.consolidated else 0,
                 1 if topic.is_big_event else 0,
+                topic.turn_id,
                 topic.create_ts or int(time.time()),
             ),
         )
@@ -82,11 +84,48 @@ class TopicStore:
                    t.keywords as keywords, t.session_id as session_id,
                    t.snapshot_version as snapshot_version, t.kind as kind,
                    t.consolidated as consolidated, t.is_big_event as is_big_event,
+                   t.turn_id as turn_id,
                    t.create_ts as create_ts
             from topic as t
             where t.space_id = ? and t.topic_id = ?
             """,
             (space_id, topic_id),
+        ).fetchone()
+
+        if not row:
+            return None
+
+        return self._row_to_topic(space_id, row)
+
+    def get_topic_by_turn(self, space_id: str, turn_id: str) -> Optional[Topic]:
+        """
+        按来源轮次取回主题（归档幂等的判据）。
+
+        同一轮对话只应沉淀成一条主题。重复归档（例如后台线程重试、
+        手动补跑归档）时靠这里判断"这轮已经沉淀过了"。
+
+        :param space_id: 记忆空间
+        :param turn_id: 来源轮次标识
+        :return: 主题对象，不存在返回 None
+        """
+        if not turn_id:
+            return None
+
+        connection = self.db.conn()
+        row = connection.execute(
+            """
+            select t.topic_id as topic_id, t.title as title, t.abstract as abstract,
+                   t.keywords as keywords, t.session_id as session_id,
+                   t.snapshot_version as snapshot_version, t.kind as kind,
+                   t.consolidated as consolidated, t.is_big_event as is_big_event,
+                   t.turn_id as turn_id,
+                   t.create_ts as create_ts
+            from topic as t
+            where t.space_id = ? and t.turn_id = ?
+            order by t.create_ts asc
+            limit 1
+            """,
+            (space_id, turn_id),
         ).fetchone()
 
         if not row:
@@ -109,6 +148,7 @@ class TopicStore:
                    t.keywords as keywords, t.session_id as session_id,
                    t.snapshot_version as snapshot_version, t.kind as kind,
                    t.consolidated as consolidated, t.is_big_event as is_big_event,
+                   t.turn_id as turn_id,
                    t.create_ts as create_ts
             from topic as t
             where t.space_id = ?
@@ -146,6 +186,7 @@ class TopicStore:
                    t.keywords as keywords, t.session_id as session_id,
                    t.snapshot_version as snapshot_version, t.kind as kind,
                    t.consolidated as consolidated, t.is_big_event as is_big_event,
+                   t.turn_id as turn_id,
                    t.create_ts as create_ts
             from topic as t
             where t.space_id = ?
@@ -259,6 +300,7 @@ class TopicStore:
             kind=str(row["kind"] or "normal") if "kind" in keys else "normal",
             consolidated=bool(row["consolidated"]) if "consolidated" in keys else False,
             is_big_event=bool(row["is_big_event"]) if "is_big_event" in keys else False,
+            turn_id=(row["turn_id"] or "") if "turn_id" in keys else "",
             create_ts=int(row["create_ts"] or 0),
         )
 

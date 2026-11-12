@@ -71,6 +71,7 @@ _SCHEMA_STATEMENTS = [
         kind             text default 'normal',  -- normal / daily（日结）/ event（大事）
         consolidated     integer default 0,      -- 是否已被上一层归并（1 = 已归并）
         is_big_event     integer default 0,      -- 是否被判定为大事
+        turn_id          text,              -- 来源轮次（归档幂等依据）
         create_ts        integer,
         primary key (space_id, topic_id)
     )
@@ -114,7 +115,8 @@ _SCHEMA_STATEMENTS = [
     create table if not exists persona_meta (
         space_id        text primary key,
         current_version integer,            -- 当前快照版本号
-        persona_name    text                -- 人格名称
+        persona_name    text,                -- 人格名称
+        persona_frozen  integer default 0    -- 人格冻结标记（1 = 冻结，停止一切人格演化）
     )
     """,
     # 人格变迁日志（append-only）
@@ -195,12 +197,42 @@ _SCHEMA_STATEMENTS = [
         space_id    text,
         session_id  text,
         due_ts      integer,            -- 计划主动联系的时间戳（秒）
-        status      text default 'pending',  -- pending / fired / cancelled
+        status      text default 'pending',  -- pending / fired / cancelled / skipped
         reason      text,               -- 模型给出的排期理由（审计用）
         source      text,               -- llm / fallback / manual
         create_ts   integer,
         update_ts   integer,
         primary key (space_id, session_id)
+    )
+    """,
+    # 信念纠正审计：用户手动改错 / 确认 / 否决时留一条账，
+    # 这样"这条信念为什么变了"永远查得到，也便于回滚。
+    """
+    create table if not exists belief_correction (
+        space_id       text,
+        correction_id  text,
+        rid            text,             -- 被改动的信念 id
+        head_name      text,
+        rel            text,
+        old_tail       text,             -- 改之前的取值
+        new_tail       text,             -- 改之后的取值（否决时为空）
+        action         text,             -- confirm / correct / reject
+        note           text,             -- 用户备注
+        create_ts      integer,
+        primary key (space_id, correction_id)
+    )
+    """,
+    # 主动联系策略（每空间一行）：免打扰时段、每日上限等用户偏好
+    """
+    create table if not exists proactive_policy (
+        space_id          text primary key,
+        dnd_start         integer default 23,   -- 免打扰开始小时（本地时间 0~23）
+        dnd_end           integer default 8,    -- 免打扰结束小时
+        daily_cap         integer default 3,    -- 每日主动消息上限
+        cooldown_minutes  integer default 60,   -- 同一条记忆的冷却时间
+        skip_next         integer default 0,    -- 用户点了"这轮先别发"
+        create_ts         integer,
+        update_ts         integer
     )
     """,
 ]
@@ -222,6 +254,17 @@ _COLUMN_MIGRATIONS = [
     # 关系维度是否允许多值并存：多值维度（室友/朋友/喜欢的作品）新取值与旧值共存，
     # 单值维度（生日/主用语言）维持"新值推翻旧值"。抽取时由模型按常识判断
     ("kg_relation", "multi_valued", "multi_valued integer default 0"),
+    # 信念溯源字段（P1）：让每条信念都能回答"我怎么知道的"，并支持用户纠正
+    ("kg_relation", "source_turn_id", "source_turn_id text"),
+    ("kg_relation", "source_type", "source_type text default 'model_inferred'"),
+    ("kg_relation", "status", "status text default 'active'"),
+    ("kg_relation", "valid_from", "valid_from integer default 0"),
+    ("kg_relation", "valid_to", "valid_to integer default 0"),
+    ("kg_relation", "user_confirmed", "user_confirmed integer default 0"),
+    # 主题来源轮次：归档幂等的依据（同一轮对话只沉淀一次）
+    ("topic", "turn_id", "turn_id text"),
+    # 人格冻结：用户明确要求"她不要再变了"时，停止一切人格参数演化
+    ("persona_meta", "persona_frozen", "persona_frozen integer default 0"),
 ]
 
 
@@ -297,6 +340,19 @@ class Database:
             }
             if column not in existing:
                 connection.execute(f"alter table {table} add column {ddl}")
+
+        # 数据修复：早期版本注入的前史信念没有来源标记，统一回填为 seed。
+        # 只改仍为 model_inferred 且没有轮次来源的前史行，
+        # 避免覆盖用户之后的确认 / 纠正。
+        try:
+            connection.execute(
+                "update kg_relation set source_type = 'seed'"
+                " where rid like 'seed_r%'"
+                " and (source_turn_id is null or source_turn_id = '')"
+                " and (source_type is null or source_type = 'model_inferred')"
+            )
+        except sqlite3.OperationalError:
+            pass
 
         connection.commit()
 

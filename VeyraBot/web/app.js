@@ -1,5 +1,5 @@
 /* ============================================================
- * 江妍 · 认知主体 Web UI（微信电脑版风格）v20261111
+ * 江妍 · 认知主体 Web UI（微信电脑版风格）v20261113
  *
  * - 单联系人：只有江妍，一个固定会话（不暴露空间/会话等技术概念）
  * - 聊天：POST /api/chat
@@ -43,8 +43,15 @@ function fmtListTime(ts) {
   if (!ts) return "";
   const d = new Date(ts * 1000);
   const now = new Date();
-  if (d.toDateString() === now.toDateString()) return fmtTime(ts);
-  return `${d.getMonth() + 1}/${d.getDate()}`;
+  const showTime = (ts) => fmtTime(ts);
+  // 聊天记录里的时间分组：
+  // 今天 → 直接显示时间；昨天 → 昨天 + 时间；前天 → 前天 + 时间；更早 → 具体日期 + 时间
+  if (d.toDateString() === now.toDateString()) return showTime(ts);
+  const yest = new Date(now.getTime() - 24 * 3600 * 1000);
+  if (d.toDateString() === yest.toDateString()) return `昨天 ${showTime(ts)}`;
+  const d2 = new Date(now.getTime() - 2 * 24 * 3600 * 1000);
+  if (d.toDateString() === d2.toDateString()) return `前天 ${showTime(ts)}`;
+  return `${d.getFullYear()}年${d.getMonth() + 1}月${d.getDate()}日 ${showTime(ts)}`;
 }
 
 async function api(path, options = {}) {
@@ -112,7 +119,7 @@ function makeMsg(role, content, ts) {
 function makeTimeDivider(ts) {
   const el = document.createElement("div");
   el.className = "time-divider";
-  el.textContent = fmtTime(ts);
+  el.textContent = fmtListTime(ts);
   el.dataset.ts = ts;
   return el;
 }
@@ -350,6 +357,268 @@ async function pollOutbox() {
   }
 }
 
+
+/* ---------------- 功能开关（设置页「功能」页签） ---------------- */
+/* 对应 config 中的布尔开关：设置页保存后，服务端临时覆盖 config 并重建 agent */
+const FEATURE_SETTINGS = [
+  { key: "AFFECTION_ENABLED", label: "好感度系统", note: "关闭后不再产生好感度演化与关系事件消息" },
+  { key: "PROACTIVE_ENABLED", label: "日常主动联系", note: "关闭后不再按时间表从记忆库主动发消息" },
+  { key: "ENABLE_ARCHIVE", label: "主动归档", note: "关闭后每轮对话不再写入主题/信念/经验记忆" },
+  { key: "ARCHIVE_SYNC", label: "归档同步执行", note: "关闭后可改为后台执行归档" },
+  { key: "RAG_LOOP_ENABLED", label: "多轮检索循环", note: "关闭后检索只执行一轮" },
+  { key: "ENABLE_RAG", label: "RAG 兜底", note: "关闭后不启用本地语料检索" },
+  { key: "PERSONA_DAILY_SETTLE_ENABLED", label: "人格日结结算", note: "关闭后人格基调不再每日推进" },
+  { key: "DAILY_CONSOLIDATE_ENABLED", label: "日结巩固", note: "关闭后不再每天归并往事" },
+  { key: "BIG_EVENT_TRIGGER", label: "大事立即沉淀", note: "关闭后大事只归档，不立即生成事件记忆" },
+  { key: "BIG_EVENT_REQUIRE_SELF", label: "大事需涉及本人", note: "关闭后大事按纯重要度判定（可能误判）" },
+  { key: "CONSOLIDATE_MARK_CONSUMED", label: "日结标记已归并", note: "关闭后原主题不再标记为已归并" },
+  { key: "VECTOR_EXPAND_ENABLED", label: "同义词检索扩展", note: "关闭后检索只用字面 TF-IDF" },
+  { key: "DAILY_USE_MODEL", label: "日结使用模型摘要", note: "关闭后日结退化为机械摘要" },
+];
+
+function renderFeatureSettings() {
+  const host = document.getElementById("tab-features");
+  if (!host) return;
+  host.innerHTML = "";
+  for (const f of FEATURE_SETTINGS) {
+    const row = document.createElement("div");
+    row.className = "setting-row";
+    row.innerHTML = `
+      <div class="setting-label">${f.label}</div>
+      <label class="switch">
+        <input type="checkbox" data-feature="${f.key}" checked>
+        <span class="slider"></span>
+      </label>
+      <span class="setting-note">${f.note}</span>`;
+    host.appendChild(row);
+  }
+  // 初始值从已保存的设置读取，避免界面与磁盘不一致
+  for (const f of FEATURE_SETTINGS) {
+    const cb = host.querySelector(`input[data-feature="${f.key}"]`);
+    if (cb && state.features && state.features[f.key] !== undefined) {
+      cb.checked = state.features[f.key];
+    }
+  }
+}
+
+function updateFeatureSettingsUI() {
+  const host = document.getElementById("tab-features");
+  if (!host) return;
+  state.features = state.features || {};
+  // 把界面状态同步回 state，保存时一起提交
+  for (const f of FEATURE_SETTINGS) {
+    const cb = host.querySelector(`input[data-feature="${f.key}"]`);
+    if (cb) state.features[f.key] = cb.checked;
+  }
+}
+
+function toggleFeature(key, checked) {
+  state.features = state.features || {};
+  state.features[key] = !!checked;
+}
+
+/* ---------------- 记忆：信念列表与纠正 ---------------- */
+
+const BELIEF_STATUS_LABEL = {
+  active: "生效",
+  candidate: "待验证",
+  rejected: "已否决",
+};
+
+async function loadBeliefs() {
+  const host = $("#beliefList");
+  if (!host) return;
+  host.innerHTML = `<p class="belief-empty">正在读取……</p>`;
+  try {
+    const data = await api(
+      `/api/memory/beliefs?space_id=${encodeURIComponent(state.space)}&limit=120`
+    );
+    const beliefs = data.beliefs || [];
+    host.innerHTML = "";
+    if (!beliefs.length) {
+      host.innerHTML = `<p class="belief-empty">她还没有记住需要纠正的事。</p>`;
+      return;
+    }
+    for (const b of beliefs) {
+      host.appendChild(makeBeliefItem(b));
+    }
+  } catch (err) {
+    host.innerHTML = `<p class="belief-empty">读取失败：${err.message}</p>`;
+  }
+}
+
+function makeBeliefItem(belief) {
+  const item = document.createElement("div");
+  item.className = "belief-item";
+
+  const main = document.createElement("div");
+  main.className = "belief-main";
+  const text = document.createElement("div");
+  text.className = "belief-text";
+  text.textContent = `${belief.head} ${belief.rel} ${belief.tail}`;
+  const meta = document.createElement("div");
+  meta.className = "belief-meta";
+  const sourceLabel =
+    belief.source_type === "user_stated"
+      ? "你说过"
+      : belief.source_type === "user_corrected"
+      ? "你纠正过"
+      : belief.source_type === "seed"
+      ? "前史"
+      : "她推断";
+  meta.textContent = `${sourceLabel} · 置信 ${Number(belief.confidence).toFixed(2)} · 重要 ${Number(belief.importance).toFixed(2)}`;
+  main.appendChild(text);
+  main.appendChild(meta);
+
+  const status = document.createElement("span");
+  status.className = `belief-status ${belief.status || "active"}`;
+  status.textContent = BELIEF_STATUS_LABEL[belief.status] || belief.status || "生效";
+
+  const actions = document.createElement("div");
+  actions.className = "belief-actions";
+  const mk = (label, action) => {
+    const btn = document.createElement("button");
+    btn.className = "btn-secondary";
+    btn.textContent = label;
+    btn.addEventListener("click", () => updateBelief(belief.rid, action, btn));
+    return btn;
+  };
+  actions.appendChild(mk("确认", "confirm"));
+  actions.appendChild(mk("纠正", "correct"));
+  actions.appendChild(mk("否决", "reject"));
+
+  item.appendChild(main);
+  item.appendChild(status);
+  item.appendChild(actions);
+  return item;
+}
+
+async function updateBelief(rid, action, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    await api("/api/memory/beliefs/update", {
+      method: "POST",
+      body: JSON.stringify({ space_id: state.space, rid, action }),
+    });
+    await loadBeliefs();
+  } catch (err) {
+    alert(`操作失败：${err.message}`);
+    if (btn) btn.disabled = false;
+  }
+}
+
+/* ---------------- 人格：冻结 / 回退 / 主动联系偏好 ---------------- */
+
+async function loadPersonaSettings() {
+  const summary = $("#personaSummary");
+  try {
+    const data = await api(
+      `/api/persona?space_id=${encodeURIComponent(state.space)}`
+    );
+    const frozen = !!data.frozen;
+    const sw = $("#personaFrozenSwitch");
+    if (sw) sw.checked = frozen;
+    if (summary) {
+      const version = data.version ?? 0;
+      const selfView = (data.self_view || "").trim();
+      summary.textContent = `当前人格版本 v${version}${selfView ? ` · ${selfView}` : ""}${frozen ? " · 已冻结" : ""}`;
+    }
+  } catch (err) {
+    if (summary) summary.textContent = `人格状态读取失败：${err.message}`;
+  }
+
+  try {
+    const policyData = await api(
+      `/api/proactive/policy?space_id=${encodeURIComponent(state.space)}`
+    );
+    const p = policyData.policy || {};
+    $("#dndStartInput").value = p.dnd_start ?? 23;
+    $("#dndEndInput").value = p.dnd_end ?? 8;
+    $("#dailyCapInput").value = p.daily_cap ?? 3;
+    $("#cooldownInput").value = p.cooldown_minutes ?? 60;
+  } catch (err) {
+    /* 偏好读取失败不影响冻结/回退 */
+  }
+}
+
+async function setPersonaFrozen(frozen) {
+  const status = $("#personaSummary");
+  try {
+    const data = await api("/api/persona/freeze", {
+      method: "POST",
+      body: JSON.stringify({ space_id: state.space, frozen }),
+    });
+    if (status) status.textContent = data.frozen ? "人格已冻结" : "人格已解冻";
+  } catch (err) {
+    alert(`操作失败：${err.message}`);
+    const sw = $("#personaFrozenSwitch");
+    if (sw) sw.checked = !frozen;
+  }
+}
+
+async function resetPersona() {
+  if (!confirm("把她的性格回到最初吗？记忆和往事会保留。")) return;
+  try {
+    await api("/api/persona/reset", {
+      method: "POST",
+      body: JSON.stringify({ space_id: state.space }),
+    });
+    await loadPersonaSettings();
+    const status = $("#personaSummary");
+    if (status) status.textContent = "人格已回到基线";
+  } catch (err) {
+    alert(`操作失败：${err.message}`);
+  }
+}
+
+async function saveProactivePolicy() {
+  const status = $("#policyStatus");
+  const toInt = (id, fallback) => {
+    const v = parseInt($(id).value, 10);
+    return Number.isFinite(v) ? v : fallback;
+  };
+  try {
+    await api("/api/proactive/policy", {
+      method: "POST",
+      body: JSON.stringify({
+        space_id: state.space,
+        dnd_start: toInt("#dndStartInput", 23),
+        dnd_end: toInt("#dndEndInput", 8),
+        daily_cap: toInt("#dailyCapInput", 3),
+        cooldown_minutes: toInt("#cooldownInput", 60),
+      }),
+    });
+    if (status) {
+      status.textContent = "已保存";
+      status.className = "setting-status ok";
+    }
+  } catch (err) {
+    if (status) {
+      status.textContent = `保存失败：${err.message}`;
+      status.className = "setting-status err";
+    }
+  }
+}
+
+async function skipNextProactive() {
+  const status = $("#policyStatus");
+  try {
+    await api("/api/proactive/skip", {
+      method: "POST",
+      body: JSON.stringify({ space_id: state.space }),
+    });
+    if (status) {
+      status.textContent = "这一轮她不会主动来找你";
+      status.className = "setting-status ok";
+    }
+  } catch (err) {
+    if (status) {
+      status.textContent = `操作失败：${err.message}`;
+      status.className = "setting-status err";
+    }
+  }
+}
+
 /* ---------------- 设置窗口 ---------------- */
 
 function fillModelSuggestions(provider) {
@@ -367,6 +636,7 @@ async function refreshSettings() {
   const data = await api("/api/settings");
   state.providers = data.providers || [];
   state.settings = data.settings || {};
+  state.features = (state.settings && state.settings.features) || {};
   if (data.space) state.space = data.space;
 
   const sel = $("#providerSelect");
@@ -386,6 +656,7 @@ async function refreshSettings() {
     ? `已保存（${state.settings.api_key_masked}），留空则不修改`
     : "未设置";
   fillModelSuggestions();
+  renderFeatureSettings();
 }
 
 async function openSettings() {
@@ -395,6 +666,7 @@ async function openSettings() {
   status.className = "setting-status";
   try {
     await refreshSettings();
+    renderFeatureSettings();
     refreshAvatarPreview();
   } catch (err) {
     status.textContent = `设置读取失败：${err.message}`;
@@ -417,6 +689,8 @@ async function saveModelSettings() {
   btn.disabled = true;
   setStatus(status, "正在保存…");
   try {
+    // 先把功能开关从界面同步回 state，确保保存的是所有开关的当前状态
+    updateFeatureSettingsUI();
     await api("/api/settings", {
       method: "POST",
       body: JSON.stringify({
@@ -424,6 +698,7 @@ async function saveModelSettings() {
         base_url: $("#baseUrlInput").value.trim(),
         model: $("#modelInput").value.trim(),
         api_key: $("#apiKeyInput").value.trim(),
+        features: JSON.stringify(state.features),
       }),
     });
     await refreshSettings();
@@ -559,11 +834,22 @@ function bindEvents() {
     item.addEventListener("click", () => {
       document.querySelectorAll(".modal-nav-item").forEach((x) => x.classList.remove("active"));
       item.classList.add("active");
-      ["general", "model", "profile"].forEach((tab) => {
-        $(`#tab-${tab}`).classList.toggle("hidden", tab !== item.dataset.tab);
+      ["general", "model", "profile", "features", "memory", "persona"].forEach((tab) => {
+        const el = $(`#tab-${tab}`);
+        if (el) el.classList.toggle("hidden", tab !== item.dataset.tab);
       });
+      if (item.dataset.tab === "memory") loadBeliefs();
+      if (item.dataset.tab === "persona") loadPersonaSettings();
     });
   });
+
+  $("#beliefRefreshBtn").addEventListener("click", loadBeliefs);
+  $("#personaFrozenSwitch").addEventListener("change", (e) => {
+    setPersonaFrozen(e.target.checked);
+  });
+  $("#personaResetBtn").addEventListener("click", resetPersona);
+  $("#savePolicyBtn").addEventListener("click", saveProactivePolicy);
+  $("#skipNextBtn").addEventListener("click", skipNextProactive);
 
   $("#darkSwitch").addEventListener("change", (e) => {
     setTheme(e.target.checked ? "dark" : "light");

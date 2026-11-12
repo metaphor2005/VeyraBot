@@ -200,8 +200,10 @@ class KGStore:
                 """
                 insert into kg_relation
                     (space_id, rid, head_name, rel, tail_name, confidence, importance,
-                     multi_valued, is_active, source_topic_id, create_ts, update_ts)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     multi_valued, is_active, source_topic_id,
+                     source_turn_id, source_type, status, valid_from, valid_to,
+                     user_confirmed, create_ts, update_ts)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 on conflict (space_id, rid) do update set
                     tail_name = excluded.tail_name,
                     confidence = excluded.confidence,
@@ -209,6 +211,12 @@ class KGStore:
                     multi_valued = excluded.multi_valued,
                     is_active = excluded.is_active,
                     source_topic_id = excluded.source_topic_id,
+                    source_turn_id = excluded.source_turn_id,
+                    source_type = excluded.source_type,
+                    status = excluded.status,
+                    valid_from = excluded.valid_from,
+                    valid_to = excluded.valid_to,
+                    user_confirmed = excluded.user_confirmed,
                     update_ts = excluded.update_ts
                 """,
                 (
@@ -222,6 +230,12 @@ class KGStore:
                     1 if relation.multi_valued else 0,
                     1 if relation.is_active else 0,
                     relation.source_topic_id,
+                    relation.source_turn_id or "",
+                    relation.source_type or "model_inferred",
+                    relation.status or "active",
+                    int(relation.valid_from or 0),
+                    int(relation.valid_to or 0),
+                    1 if relation.user_confirmed else 0,
                     relation.create_ts or now,
                     now,
                 ),
@@ -453,3 +467,350 @@ class KGStore:
             (space_id,),
         ).fetchone()
         return int(row["cnt"]) if row else 0
+
+    # ------------------------------------------------------------
+    # 信念查询与修正（P1：用户可纠正、可确认、可否决）
+    # ------------------------------------------------------------
+    def list_beliefs(
+        self,
+        space_id: str,
+        status: Optional[str] = None,
+        only_active: bool = True,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """
+        列出该空间的信念（KG 关系）。
+
+        :param space_id: 记忆空间
+        :param status: 限定信念状态；None 表示全部
+        :param only_active: 只取生效记录（False 时包含被推翻历史行）
+        :param limit: 返回条数上限
+        :return: 信念字典列表
+        """
+        connection = self.db.conn()
+        sql = """
+            select r.rid as rid, r.head_name as head_name, r.rel as rel,
+                   r.tail_name as tail_name, r.confidence as confidence,
+                   r.importance as importance, r.status as status,
+                   r.valid_from as valid_from, r.valid_to as valid_to,
+                   r.user_confirmed as user_confirmed, r.source_turn_id as source_turn_id,
+                   r.source_type as source_type
+            from kg_relation as r
+            where r.space_id = ?
+        """
+        if status:
+            sql += " and r.status = ?"
+        if only_active:
+            sql += " and r.is_active = 1"
+        sql += " order by r.importance desc, r.confidence desc limit ?"
+        params: list = [space_id]
+        if status:
+            params.append(status)
+        params.append(int(limit))
+        rows = connection.execute(sql, params).fetchall()
+        return [
+            {
+                "rid": row["rid"],
+                "head": row["head_name"],
+                "rel": row["rel"],
+                "tail": row["tail_name"],
+                "confidence": float(row["confidence"]),
+                "importance": float(row["importance"]),
+                "status": row["status"],
+                "valid_from": int(row["valid_from"] or 0),
+                "valid_to": int(row["valid_to"] or 0),
+                "user_confirmed": bool(row["user_confirmed"]),
+                "source_turn_id": row["source_turn_id"] or "",
+                "source_type": row["source_type"] or "",
+            }
+            for row in rows
+        ]
+
+    def get_belief(self, space_id: str, rid: str) -> Optional[Dict[str, Any]]:
+        """按 rid 取回单条信念。"""
+        connection = self.db.conn()
+        row = connection.execute(
+            """
+            select r.rid as rid, r.head_name as head_name, r.rel as rel,
+                   r.tail_name as tail_name, r.confidence as confidence,
+                   r.importance as importance, r.status as status,
+                   r.valid_from as valid_from, r.valid_to as valid_to,
+                   r.user_confirmed as user_confirmed, r.source_turn_id as source_turn_id,
+                   r.source_type as source_type
+            from kg_relation as r
+            where r.space_id = ? and r.rid = ?
+            """,
+            (space_id, rid),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "rid": row["rid"],
+            "head": row["head_name"],
+            "rel": row["rel"],
+            "tail": row["tail_name"],
+            "confidence": float(row["confidence"]),
+            "importance": float(row["importance"]),
+            "status": row["status"],
+            "valid_from": int(row["valid_from"] or 0),
+            "valid_to": int(row["valid_to"] or 0),
+            "user_confirmed": bool(row["user_confirmed"]),
+            "source_turn_id": row["source_turn_id"] or "",
+            "source_type": row["source_type"] or "",
+        }
+
+    def confirm_belief(self, space_id: str, rid: str) -> bool:
+        """
+        用户手动确认一条信念（把状态置为已确认、标记生效、写审计）。
+
+        :param space_id: 记忆空间
+        :param rid: 信念 id
+        :return: 是否成功
+        """
+        return bool(
+            self.update_belief(space_id, rid, action="confirm", note="用户确认")[
+                "updated"
+            ]
+        )
+
+    def correct_belief(self, space_id: str, rid: str) -> bool:
+        """
+        用户手动纠正一条信念（把状态置为待验证，保留原值作对照）。
+
+        :param space_id: 记忆空间
+        :param rid: 信念 id
+        :return: 是否成功
+        """
+        return bool(
+            self.update_belief(space_id, rid, action="correct", note="用户纠正")[
+                "updated"
+            ]
+        )
+
+    def reject_belief(self, space_id: str, rid: str) -> bool:
+        """
+        用户否决一条信念（状态置为 rejected，保留原值作对照）。
+
+        :param space_id: 记忆空间
+        :param rid: 信念 id
+        :return: 是否成功
+        """
+        return bool(
+            self.update_belief(space_id, rid, action="reject", note="用户否决")[
+                "updated"
+            ]
+        )
+
+    def update_belief(
+        self,
+        space_id: str,
+        rid: str,
+        action: Optional[str] = None,
+        confidence: Optional[float] = None,
+        importance: Optional[float] = None,
+        status: Optional[str] = None,
+        user_confirmed: Optional[bool] = None,
+        valid_from: Optional[int] = None,
+        valid_to: Optional[int] = None,
+        source_turn_id: Optional[str] = None,
+        source_type: Optional[str] = None,
+        note: str = "",
+    ) -> Dict[str, Any]:
+        """
+        更新（或回填）一条信念的字段。
+
+        :param space_id: 记忆空间
+        :param rid: 信念 id
+        :param action: confirm / correct / reject（缺省时只按参数更新）
+        :param confidence/importance/status/valid_from/valid_to：新值
+        :param user_confirmed: 用户是否手动确认
+        :param source_turn_id/source_type: 溯源字段（来自抽取结果）
+        :param note: 备注
+        :return: 更新结果字典
+        """
+        connection = self.db.conn()
+        result: Dict[str, Any] = {
+            "updated": False,
+            "action": action,
+            "note": note,
+        }
+        if not connection.execute(
+            "select 1 from kg_relation where space_id = ? and rid = ?",
+            (space_id, rid),
+        ).fetchone():
+            return result
+
+        updates: List[Tuple[str, Any]] = [
+            ("confidence", confidence),
+            ("importance", importance),
+            ("status", status),
+            (
+                "user_confirmed",
+                int(user_confirmed) if user_confirmed is not None else None,
+            ),
+            ("valid_from", valid_from),
+            ("valid_to", valid_to),
+            ("source_turn_id", source_turn_id),
+            ("source_type", source_type),
+        ]
+        for column, value in updates:
+            if value is None:
+                continue
+            connection.execute(
+                f"update kg_relation set {column} = ?, update_ts = ?"
+                " where space_id = ? and rid = ?",
+                (value, int(time.time()), space_id, rid),
+            )
+
+        # 用户动作落审计表：确认 → active + user_confirmed；纠正 → candidate；否决 → rejected
+        if action == "confirm":
+            connection.execute(
+                "update kg_relation set status = 'active', user_confirmed = 1,"
+                " is_active = 1, update_ts = ? where space_id = ? and rid = ?",
+                (int(time.time()), space_id, rid),
+            )
+        elif action == "correct":
+            connection.execute(
+                "update kg_relation set status = 'candidate', user_confirmed = 0,"
+                " update_ts = ? where space_id = ? and rid = ?",
+                (int(time.time()), space_id, rid),
+            )
+        elif action == "reject":
+            connection.execute(
+                "update kg_relation set status = 'rejected', is_active = 0,"
+                " update_ts = ? where space_id = ? and rid = ?",
+                (int(time.time()), space_id, rid),
+            )
+
+        if action:
+            row = connection.execute(
+                "select head_name, rel, tail_name from kg_relation"
+                " where space_id = ? and rid = ?",
+                (space_id, rid),
+            ).fetchone()
+            self._append_correction(
+                space_id,
+                action,
+                note or f"用户{action}",
+                {
+                    "rid": rid,
+                    "head_name": row["head_name"] if row else "",
+                    "rel": row["rel"] if row else "",
+                    "old_tail": row["tail_name"] if row else "",
+                    "new_tail": row["tail_name"] if row else "",
+                },
+            )
+
+        result["updated"] = True
+        result["action"] = action or "update"
+        connection.commit()
+        return result
+
+    def _append_correction(
+        self,
+        space_id: str,
+        action: str,
+        note: str = "",
+        relation: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        写一条信念纠正审计记录（confirm / correct / reject）。
+
+        :param space_id: 记忆空间
+        :param action: 动作类型
+        :param note: 备注
+        :param relation: 相关信念信息（rid / head_name / rel / old_tail / new_tail）
+        :return: 写入的记录列表
+        """
+        from cognitive.models import new_id
+
+        relation = relation or {}
+        now = int(time.time())
+        record_id = new_id("clr")
+        connection = self.db.conn()
+        connection.execute(
+            """
+            insert into belief_correction
+                (space_id, correction_id, rid, head_name, rel, old_tail, new_tail,
+                 action, note, create_ts)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                space_id,
+                record_id,
+                relation.get("rid", ""),
+                relation.get("head_name", ""),
+                relation.get("rel", ""),
+                relation.get("old_tail", ""),
+                relation.get("new_tail", ""),
+                action,
+                note or "",
+                now,
+            ),
+        )
+        connection.commit()
+        return [
+            {
+                "correction_id": record_id,
+                "rid": relation.get("rid", ""),
+                "action": action,
+                "note": note or "",
+                "create_ts": now,
+            }
+        ]
+
+    def list_corrections(
+        self, space_id: str, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """
+        列出信念纠正审计记录（最新的在前）。
+
+        :param space_id: 记忆空间
+        :param limit: 条数上限
+        :return: 审计记录列表
+        """
+        connection = self.db.conn()
+        rows = connection.execute(
+            """
+            select correction_id, rid, head_name, rel, old_tail, new_tail,
+                   action, note, create_ts
+            from belief_correction
+            where space_id = ?
+            order by create_ts desc
+            limit ?
+            """,
+            (space_id, int(limit)),
+        ).fetchall()
+        return [
+            {
+                "correction_id": row["correction_id"],
+                "rid": row["rid"],
+                "head": row["head_name"],
+                "rel": row["rel"],
+                "old_tail": row["old_tail"],
+                "new_tail": row["new_tail"],
+                "action": row["action"],
+                "note": row["note"],
+                "create_ts": int(row["create_ts"] or 0),
+            }
+            for row in rows
+        ]
+
+    def clear_belief(self, space_id: str, rid: str) -> bool:
+        """
+        把一条已失效信念标记为未生效（回滚）。
+
+        :param space_id: 记忆空间
+        :param rid: 信念 id
+        :return: 是否成功
+        """
+        connection = self.db.conn()
+        cursor = connection.execute(
+            """
+            update kg_relation set is_active = 0, update_ts = ?
+            where space_id = ? and rid = ?
+            """,
+            (int(time.time()), space_id, rid),
+        )
+        connection.commit()
+        return cursor.rowcount > 0

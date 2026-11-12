@@ -41,10 +41,16 @@ class Message:
     role: str                        # user / assistant / system
     content: str = ""                # 消息正文
     ts: int = field(default_factory=_now)   # 记录时间
+    turn_id: str = ""                # 所属轮次标识（同一轮的多个气泡共享同一个值）
 
     def to_dict(self) -> Dict[str, Any]:
         """序列化为字典，用于持久化。"""
-        return {"role": self.role, "content": self.content, "ts": self.ts}
+        return {
+            "role": self.role,
+            "content": self.content,
+            "ts": self.ts,
+            "turn_id": self.turn_id,
+        }
 
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "Message":
@@ -53,6 +59,7 @@ class Message:
             role=data.get("role", ""),
             content=data.get("content", ""),
             ts=int(data.get("ts", _now())),
+            turn_id=str(data.get("turn_id") or ""),
         )
 
 
@@ -74,15 +81,16 @@ class SessionContext:
     create_ts: int = field(default_factory=_now)
     update_ts: int = field(default_factory=_now)
 
-    def append(self, role: str, content: str) -> Message:
+    def append(self, role: str, content: str, turn_id: str = "") -> Message:
         """
         追加一条消息并刷新更新时间。
 
         :param role: 角色
         :param content: 正文
+        :param turn_id: 所属轮次标识（同一轮的多个气泡共享同一个值）
         :return: 新建的消息对象
         """
-        msg = Message(role=role, content=content)
+        msg = Message(role=role, content=content, turn_id=turn_id)
         self.messages.append(msg)
         self.update_ts = _now()
         return msg
@@ -149,6 +157,7 @@ class Topic:
     kind: str = "normal"          # normal（普通事件）/ daily（日结）/ event（大事沉淀）
     consolidated: bool = False    # 是否已被上一层（日结）归并
     is_big_event: bool = False    # 是否被判定为大事
+    turn_id: str = ""             # 来源轮次（归档幂等的依据：同一轮只归档一次）
     create_ts: int = field(default_factory=_now)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -193,6 +202,18 @@ class KGRelation:
     - multi_valued：该关系维度是否允许多个取值并存。
       由归档抽取时模型按常识判断（"室友"可以有好几个，"生日"只能有一个）。
       多值维度出现新取值时与旧值共存；单值维度仍然"新值推翻旧值"。
+
+    溯源字段（P1 新增，让每条信念都能回答"我怎么知道的"）：
+    - source_turn_id：这条信念来自哪一轮对话（与 topic.turn_id 对齐）
+    - source_type：来源类型
+      user_stated（用户明确说过）/ model_inferred（模型推断）/
+      user_confirmed（用户手动确认）/ user_corrected（用户手动纠正）/
+      seed（人格前史）
+    - status：信念状态
+      active（已生效，参与检索）/ candidate（待确认，不参与检索）/
+      superseded（被新值取代）/ rejected（用户否决）
+    - valid_from / valid_to：生效与失效时间戳（valid_to = 0 表示仍生效）
+    - user_confirmed：用户是否手动确认过（确认过的信念不再被自动推翻）
     """
 
     rid: str
@@ -205,6 +226,12 @@ class KGRelation:
     multi_valued: bool = False
     is_active: bool = True
     source_topic_id: str = ""
+    source_turn_id: str = ""
+    source_type: str = "model_inferred"
+    status: str = "active"
+    valid_from: int = 0
+    valid_to: int = 0
+    user_confirmed: bool = False
     create_ts: int = field(default_factory=_now)
     update_ts: int = field(default_factory=_now)
 

@@ -12,7 +12,7 @@ This is not "a chatbot with a vector database bolted on". Every turn actively ar
 
 ---
 
-## Current state (2026-11-11)
+## Current state (2026-11-12)
 
 The production memory database has been reset to **persona-only**. All test, demo, and debugging sessions and their derived memories have been removed.
 
@@ -26,7 +26,8 @@ The production memory database has been reset to **persona-only**. All test, dem
 | Persona version | v0 (all 14 parameters equal `PERSONA_KERNEL_INIT`) |
 | Sessions | 0 (the Web UI starts with an empty chat) |
 | Vector index | 7 documents (seed topics only) |
-| Smoke tests | 25 / 25 passing |
+| Smoke tests | 32 / 32 passing |
+| Retrieval eval | Recall@1 = 1.000, Recall@3 = 1.000, false recall = 0 |
 
 A full backup of `data/` before the reset is kept **outside this repository**, so test data and personal runtime data are not published to GitHub.
 
@@ -40,6 +41,8 @@ A full backup of `data/` before the reset is kept **outside this repository**, s
 - **Affection and relationship events**: every person has a 0–100 affinity value. Crossing the cold threshold triggers an outreach message; crossing the severance threshold triggers a breakup message; recovering past the reconcile threshold triggers a reconciliation message.
 - **Daily initiative**: after every reply, the **LLM decides** when to reach out next. If the user stays silent until then, she sends a message drawn from her memory; if the user speaks first, that schedule is cancelled and regenerated.
 - **Multi-bubble replies**: separators and blank lines are split into multiple assistant messages **before persistence**, so reloads still show separate bubbles.
+- **Belief provenance and correction**: every belief records where it came from (`user_stated` / `model_inferred` / `user_corrected` / `seed`) and moves through `active` / `candidate` / `rejected`. Users can confirm, correct, or reject a belief; every action is written to an audit ledger.
+- **User control**: freeze the persona (memory keeps growing, personality stops drifting), reset it to the shipped baseline without deleting memories, and set proactive-contact preferences (do-not-disturb window, daily cap, cooldown, "skip this one").
 - **Developer HTTP API + Web UI**: send/receive messages, inspect memory/persona/affection, fetch proactive messages; the Web UI is a WeChat-desktop-style single-contact interface.
 
 ---
@@ -109,7 +112,14 @@ python maintenance.py --logs                     # recent consolidation logs
 python maintenance.py --prune-snapshots          # keep the newest 30 snapshots
 python maintenance.py --seed-persona --space jiangyan  # re-inject pre-history (idempotent)
 python maintenance.py --persona-info             # show persona assets + runtime data paths
+
+# P3: export / backup / reset
+python maintenance.py --export data/export.json  # dump persona + beliefs + topics + experiences
+python maintenance.py --backup                   # copy DB, vectors, snapshots to data/backups/
+python maintenance.py --reset --yes              # clear runtime memory, re-seed baseline (destructive)
 ```
+
+`--export` and `--backup` are non-destructive and should be run before `--reset`.
 
 Register a Windows scheduled task (daily at 23:50):
 
@@ -122,10 +132,13 @@ Register a Windows scheduled task (daily at 23:50):
 ### 2.7 Tests
 
 ```bash
-python tests/smoke_test.py
+python tests/smoke_test.py        # offline smoke tests
+python tests/eval/run_eval.py     # offline retrieval + persona-prompt eval
 ```
 
-Expected: **25 / 25 passing**, with no real model calls. Coverage includes storage, belief conflicts and multi-valued relations, vector retrieval, persona evolution, daily consolidation, big-event detection, the affection state machine, the proactive outbox, the proactive schedule, memory sampling, and the persona data directory.
+Expected: **32 / 32 smoke tests passing**, with no real model calls. Coverage includes storage, belief conflicts and multi-valued relations, vector retrieval, persona evolution, daily consolidation, big-event detection, the affection state machine, the proactive outbox, the proactive schedule, memory sampling, the persona data directory, turn-aware/idempotent archiving, belief provenance, user correction, persona freeze/reset, and proactive policy.
+
+The eval harness reports Recall@1 / Recall@3 / false-recall on 17 colloquial queries plus persona-prompt consistency checks (name, identity, rules, no API key, no local paths). Current result: Recall@1 = 1.000, Recall@3 = 1.000, false recall = 0.
 
 ### 2.8 Data and upgrades
 
@@ -392,7 +405,9 @@ Each part is then appended as a separate assistant message. `/api/chat` returns 
 
 ## 8. Developer HTTP API
 
-Start with `python api/server.py`. Defaults to `127.0.0.1:8000`, no auth. To expose it, change `API_HOST=0.0.0.0` and put your own gateway in front.
+Start with `python api/server.py`. Defaults to `127.0.0.1:8000`, no auth. To expose it, set `API_TOKEN` (see below) and change `API_HOST=0.0.0.0`, ideally behind your own gateway.
+
+If `API_TOKEN` is set, every `/api/*` call must send `X-API-Token: <token>` (or `?token=<token>`). `/api/health` and static files are exempt.
 
 | Method | Path | Description |
 |---|---|---|
@@ -402,14 +417,22 @@ Start with `python api/server.py`. Defaults to `127.0.0.1:8000`, no auth. To exp
 | GET | `/api/sessions/<session_id>/messages` | Full message history for a session |
 | GET | `/api/memory/overview` | Memory overview (beliefs / topics / vectors / changelog counts) |
 | GET | `/api/relations` | Belief list (`?all=1` includes overturned history) |
+| GET | `/api/memory/beliefs` | Belief list with provenance (`?status=`, `?all=1`) plus recent corrections |
+| POST | `/api/memory/beliefs/update` | Confirm / correct / reject a belief `{space_id?, rid, action, note?}` |
+| GET | `/api/memory/corrections` | Belief correction audit ledger |
 | GET | `/api/topics` | Topic (memory) list |
-| GET | `/api/persona` | Persona state (parameters / baseline / mood / core beliefs) |
+| GET | `/api/persona` | Persona state (parameters / baseline / mood / core beliefs / `frozen`) |
 | GET | `/api/persona/history` | Persona change history text |
+| POST | `/api/persona/freeze` | Freeze or unfreeze the persona `{space_id?, frozen}` |
+| POST | `/api/persona/reset` | Reset persona parameters to the shipped baseline (memories kept) |
 | GET | `/api/affection` | Affection list |
 | GET | `/api/messages/outbox` | Proactive outbox (`?pending=1` for unacknowledged only) |
 | POST | `/api/messages/outbox/ack` | Acknowledge a proactive message `{space_id, msg_id}` |
 | GET | `/api/proactive/schedule` | Next proactive contact schedule |
 | POST | `/api/proactive/tick` | Check/trigger proactive contact (`force=true` sends now) |
+| GET | `/api/proactive/policy` | Proactive preferences + how many were sent today |
+| POST | `/api/proactive/policy` | Save preferences `{dnd_start, dnd_end, daily_cap, cooldown_minutes}` |
+| POST | `/api/proactive/skip` | Skip the next proactive contact |
 | GET | `/api/settings` | Current model connection + preset providers + UI space |
 | POST | `/api/settings` | Save model connection (provider / base URL / key / model) |
 | POST | `/api/settings/test` | Test a connection with the given or current settings |
@@ -449,6 +472,8 @@ If `space_id` is omitted, `/api/chat` uses `default`. The Web UI automatically u
   - `initiative` (daily "I thought of you") → a normal assistant bubble;
   - `reach_out` / `severance` / `reconcile` (relationship events) → a centered system notice.
 - Settings window: provider / model / base URL / key / connection test / dark mode / custom avatar.
+- **记忆** tab: review what she remembers, with 确认 (confirm), 纠正 (correct), and 否决 (reject) buttons; rejected beliefs are kept for history.
+- **人格** tab: freeze/unfreeze the persona, reset it to the shipped baseline without deleting memories, and set proactive preferences (DND window, daily cap, cooldown, "skip this one").
 - Jiang Yan's avatar comes from `data/persona/avatar.jpg`; the user's uploaded avatar is stored in `data/user_avatar.json`.
 - Asset version query strings (`style.css?v=`, `app.js?v=`) force cache refresh after updates.
 
@@ -511,8 +536,10 @@ cognitive-agent/
 │   │   ├── consolidator.py         # daily consolidation + event consolidation
 │   │   └── rag.py                  # RAG fallback
 │   └── tools/base.py               # tool plugin layer (interfaces only)
-├── docs/                           # design reviews and specs
-└── tests/smoke_test.py             # 25 offline smoke tests
+├── docs/                           # design reviews, specs, improvement plan
+└── tests/
+    ├── smoke_test.py               # 32 offline smoke tests
+    └── eval/run_eval.py            # offline retrieval + persona-prompt eval
 ```
 
 ---
@@ -567,12 +594,16 @@ All settings live in `config.py` and can be overridden via environment variables
 | `PROACTIVE_TICK_SECONDS` | 30 | background scan interval |
 | `PROACTIVE_MAX_PENDING` | 3 | unread initiative backlog limit |
 | `PROACTIVE_SESSION_ID` | main | fixed Web UI session |
+| `PROACTIVE_DND_START` / `PROACTIVE_DND_END` | 23 / 8 | default do-not-disturb window (hours, crosses midnight) |
+| `PROACTIVE_DAILY_CAP` | 3 | default max proactive messages per day |
+| `PROACTIVE_COOLDOWN_MINUTES` | 60 | default minimum gap between proactive messages |
 
 ### Service and archiving
 
 | Parameter | Default | Description |
 |---|---|---|
 | `API_HOST` / `API_PORT` | 127.0.0.1 / 8000 | HTTP listener |
+| `API_TOKEN` | (empty) | optional bearer token for `/api/*`; empty means no auth |
 | `ENABLE_ARCHIVE` | true | per-turn active archiving |
 | `ARCHIVE_SYNC` | true | run archiving synchronously |
 | `BIG_EVENT_IMPORTANCE` | 0.90 | importance threshold for big-event detection |
@@ -596,7 +627,8 @@ Tuning hints:
 
 ### Verified
 
-- 25 / 25 offline smoke tests pass, including "persona data directory".
+- 32 / 32 offline smoke tests pass, including turn-aware archiving, archiver idempotency, explicit big-event input, belief provenance, user correction, persona freeze/reset, and proactive policy.
+- Offline eval: Recall@1 = 1.000, Recall@3 = 1.000, false recall = 0 on 17 colloquial queries; persona prompt passes all consistency and privacy checks.
 - Real-model end-to-end:
   - replies split on `---` / blank lines into multiple bubbles, and remain separate after reload;
   - affinity threshold events are written to the outbox and shown as centered notices;
@@ -645,6 +677,7 @@ From a philosophical perspective, it is a high-quality cognitive simulator, not 
 ## 14. Further reading
 
 - `docs/belief-system-spec.md` — belief system spec (multi-value, conflicts, provenance, evolution)
+- `docs/improvement-plan.md` — P0–P3 roadmap: what was fixed, why, file map, verification, remaining optional work
 - `docs/persona-module-review.md` — persona module design review (parameters, mapping, cadence)
 - `docs/consistency-review-2026-11-11.md` — consistency review notes
 - `data/README.md` — data layout, upgrade, and reset instructions

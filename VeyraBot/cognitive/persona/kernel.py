@@ -642,6 +642,78 @@ class PersonaKernel:
         connection.commit()
 
     # ------------------------------------------------------------
+    # 人格冻结 / 重置（P2：用户可锁定或回退人格）
+    # ------------------------------------------------------------
+    def is_frozen(self) -> bool:
+        """
+        人格是否被用户冻结。
+
+        冻结后归档仍会沉淀事实与经验，但不再修改人格参数、情景与自我认知。
+
+        :return: 是否冻结
+        """
+        connection = self.db.conn()
+        row = connection.execute(
+            "select persona_frozen from persona_meta where space_id = ?",
+            (self.space_id,),
+        ).fetchone()
+        return bool(row["persona_frozen"]) if row else False
+
+    def set_frozen(self, frozen: bool) -> bool:
+        """
+        冻结 / 解冻人格。
+
+        :param frozen: True 冻结，False 解冻
+        :return: 当前冻结状态
+        """
+        connection = self.db.conn()
+        connection.execute(
+            """
+            insert into persona_meta (space_id, current_version, persona_name, persona_frozen)
+            values (?, 0, ?, ?)
+            on conflict (space_id) do update set
+                persona_frozen = excluded.persona_frozen
+            """,
+            (self.space_id, config.PERSONA_NAME, 1 if frozen else 0),
+        )
+        connection.commit()
+        return bool(frozen)
+
+    def reset_to_baseline(self) -> Dict[str, Any]:
+        """
+        把人格参数回退到出厂基线，并清空待生效漂移与情景状态。
+
+        注意：不删除主题、信念、经验与变迁日志——重置的是"人格倾向"，
+        不是她的记忆。用户要的是"她还是她，但脾气回到最初"。
+
+        :return: 重置摘要
+        """
+        connection = self.db.conn()
+        before = self.get_params()
+        for name, value in config.PERSONA_KERNEL_INIT.items():
+            connection.execute(
+                """
+                update persona_kernel
+                set value = ?, base_value = ?, pending_value = 0
+                where space_id = ? and param = ?
+                """,
+                (float(value), float(value), self.space_id, name),
+            )
+        connection.execute(
+            "delete from persona_mood where space_id = ?", (self.space_id,)
+        )
+        connection.execute(
+            "update persona_meta set live_self_view = null where space_id = ?",
+            (self.space_id,),
+        )
+        connection.commit()
+        return {
+            "before": before,
+            "after": self.get_params(),
+            "baseline": dict(config.PERSONA_KERNEL_INIT),
+        }
+
+    # ------------------------------------------------------------
     # 供 Prompt 使用的紧凑描述
     # ------------------------------------------------------------
     # 参数名 -> (高值描述, 中值描述, 低值描述)

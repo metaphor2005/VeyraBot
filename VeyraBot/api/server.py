@@ -59,7 +59,11 @@ from flask import Flask, jsonify, request, send_file, send_from_directory
 import config
 from cognitive.engine import CognitiveAgent
 from cognitive.llm import DeepSeekClient, LLMError
-from cognitive.storage.affection_store import ProactiveScheduleStore
+from cognitive.persona.kernel import PersonaKernel
+from cognitive.storage.affection_store import (
+    ProactivePolicyStore,
+    ProactiveScheduleStore,
+)
 from cognitive.storage.database import Database
 from cognitive.storage.kg_store import KGStore
 from cognitive.storage.topic_store import TopicStore
@@ -125,6 +129,27 @@ USER_AVATAR_MAX_BYTES = 2 * 1024 * 1024
 _DATA_URL_PATTERN = re.compile(
     r"^data:(image/(?:png|jpe?g|webp|gif));base64,(.+)$", re.S
 )
+
+# ============================================================
+# 功能开关（设置页「功能」页签可切换，用户自己控制）
+# 对应 config 中的布尔开关；设置页保存后，服务端临时覆盖 config 再重建 agent，
+# 关闭某个开关就立即生效，不需要重启服务。
+# ============================================================
+FEATURE_FLAG_NAMES = [
+    "AFFECTION_ENABLED",
+    "PROACTIVE_ENABLED",
+    "ENABLE_ARCHIVE",
+    "ARCHIVE_SYNC",
+    "RAG_LOOP_ENABLED",
+    "ENABLE_RAG",
+    "PERSONA_DAILY_SETTLE_ENABLED",
+    "DAILY_CONSOLIDATE_ENABLED",
+    "BIG_EVENT_TRIGGER",
+    "BIG_EVENT_REQUIRE_SELF",
+    "CONSOLIDATE_MARK_CONSUMED",
+    "VECTOR_EXPAND_ENABLED",
+    "DAILY_USE_MODEL",
+]
 
 app = Flask(__name__, static_folder=None)
 
@@ -222,14 +247,58 @@ def _mask_key(key: str) -> str:
     return f"{key[:5]}…{key[-4:]}"
 
 
-def _settings_view(s: Dict[str, str]) -> Dict[str, Any]:
-    """把生效设置转成对外的安全视图（密钥只给掩码与是否存在）。"""
+# ============================================================
+# 功能开关（设置页「功能」页签）
+# ============================================================
+_feature_lock = threading.Lock()
+
+
+def _load_saved_features() -> Dict[str, bool]:
+    """读取持久化的功能开关（设置文件里没有则全为 False，但默认值由 config 决定）。"""
+    saved = _load_saved_settings()
+    features = saved.get("features")
+    if not isinstance(features, dict):
+        return {}
+    return {k: bool(v) for k, v in features.items()}
+
+
+def _write_saved_settings(data: Dict[str, Any]) -> None:
+    """把设置字典写回持久化文件（原子写：先写临时文件再替换）。"""
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = SETTINGS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(SETTINGS_FILE)
+
+
+def _snapshot_feature_overrides() -> Dict[str, Any]:
+    """保存当前 config 里功能开关的原始值，用于保存后恢复默认覆盖。"""
+    return {name: getattr(config, name) for name in FEATURE_FLAG_NAMES}
+
+
+def _apply_feature_overrides(overrides: Dict[str, bool]) -> None:
+    """把设置页的功能开关覆盖到 config，并写回设置文件持久化。
+
+    覆盖是"临时生效 + 持久化"：服务进程重启后仍按保存的开关继续生效，
+    无需重启服务；切换后立刻由后续请求使用新开关。
+    """
+    with _feature_lock:
+        saved = _load_saved_settings()
+        saved["features"] = {k: bool(v) for k, v in overrides.items()}
+        _write_saved_settings(saved)
+        originals = _snapshot_feature_overrides()
+        for name in FEATURE_FLAG_NAMES:
+            setattr(config, name, bool(overrides.get(name, originals.get(name))))
+
+
+def _settings_view(s: Dict[str, str], features: Optional[Dict[str, bool]] = None) -> Dict[str, Any]:
+    """把生效设置转成对外的安全视图（密钥只给掩码与是否存在，功能开关给当前状态）。"""
     return {
         "provider": s["provider"],
         "base_url": s["base_url"],
         "model": s["model"],
         "api_key_set": bool(s.get("api_key")),
         "api_key_masked": _mask_key(s.get("api_key", "")),
+        "features": features or {},
     }
 
 
@@ -364,12 +433,18 @@ def static_files(filename: str):
 # ============================================================
 @app.get("/api/settings")
 def get_settings():
-    """当前模型连接设置 + 预置供应商列表 + UI 使用的记忆空间。"""
+    """当前模型连接设置 + 预置供应商列表 + UI 使用的记忆空间 + 功能开关。"""
     s = _effective_settings()
+    saved_features = _load_saved_features()
+    # 没有保存过功能开关时，返回 config 的默认值，界面初始状态与真实状态一致
+    if not saved_features:
+        saved_features = {
+            name: bool(getattr(config, name)) for name in FEATURE_FLAG_NAMES
+        }
     return jsonify(
         {
             "ok": True,
-            "settings": _settings_view(s),
+            "settings": _settings_view(s, saved_features),
             "providers": LLM_PROVIDERS,
             "space": _ui_space(),
         }
@@ -379,10 +454,14 @@ def get_settings():
 @app.post("/api/settings")
 def save_settings():
     """
-    保存模型连接设置并立即生效（重建 agent，记忆库不变）。
+    保存模型连接设置与功能开关并立即生效（重建 agent，记忆库不变）。
 
-    body: {"provider", "base_url", "model", "api_key"}
-    api_key 留空 = 沿用已保存（或 .env）的密钥，不覆盖。
+    body:
+     模型连接：{"provider", "base_url", "model", "api_key"}（api_key 留空 = 沿用已保存/ .env 的密钥）
+     功能开关：{"AFFECTION_ENABLED": true, ...}（对应设置页「功能」页签的开关）
+
+    功能开关会持久化到设置文件，服务进程重启后仍生效；
+    本次保存后立即把新开关覆盖到 config，并重建 agent 让新开关立刻生效。
     """
     body = _body()
     cur = _effective_settings()
@@ -400,24 +479,39 @@ def save_settings():
     if not key:
         return _fail("请填写 API 密钥（可在所选服务商的官网获取）")
 
-    s = {
-        "provider": provider,
-        "base_url": base_url,
-        "model": model,
-        "api_key": key,
-    }
+    features = _load_saved_features()
+    raw_features = body.get("features")
+    if isinstance(raw_features, str):
+        try:
+            raw_features = json.loads(raw_features)
+        except (ValueError, TypeError):
+            raw_features = {}
+    if not isinstance(raw_features, dict):
+        raw_features = {}
     try:
-        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SETTINGS_FILE.write_text(
-            json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        _rebuild_agent(s)
+        saved = _load_saved_settings()
+        saved["model"] = {
+            "provider": provider,
+            "base_url": base_url,
+            "model": model,
+            "api_key": key,
+        }
+        saved["features"] = {k: bool(v) for k, v in raw_features.items()}
+        _write_saved_settings(saved)
+        # 先把功能开关覆盖到 config，再重建 agent（CognitiveAgent 会读新开关）
+        _apply_feature_overrides(saved["features"])
+        _rebuild_agent(saved["model"])
     except LLMError as exc:
         return _fail(f"设置无法应用：{exc}")
     except OSError as exc:
         return _fail(f"设置保存失败：{exc}")
 
-    return jsonify({"ok": True, "settings": _settings_view(s)})
+    return jsonify(
+        {
+            "ok": True,
+            "settings": _settings_view(saved["model"], saved["features"]),
+        }
+    )
 
 
 @app.post("/api/settings/test")
@@ -733,6 +827,75 @@ def relations():
     )
 
 
+@app.get("/api/memory/beliefs")
+def memory_beliefs():
+    """
+    信念列表（带溯源字段）。
+
+    query:
+        space_id?  默认 default
+        status?    active / candidate / rejected
+        all=1      包含被推翻的历史行
+    """
+    space_id = request.args.get("space_id") or "default"
+    agent = get_agent()
+    agent.ensure_space(space_id)
+    kg = KGStore(agent.db)
+    return jsonify(
+        {
+            "ok": True,
+            "beliefs": kg.list_beliefs(
+                space_id,
+                status=request.args.get("status") or None,
+                only_active=request.args.get("all") not in ("1", "true"),
+                limit=int(request.args.get("limit") or 200),
+            ),
+            "corrections": kg.list_corrections(space_id, limit=20),
+        }
+    )
+
+
+@app.post("/api/memory/beliefs/update")
+def memory_belief_update():
+    """
+    用户纠正信念。
+
+    body: {"space_id"?, "rid", "action": "confirm|correct|reject", "note"?}
+    """
+    body = _body()
+    space_id = str(body.get("space_id") or "default").strip() or "default"
+    rid = str(body.get("rid") or "").strip()
+    action = str(body.get("action") or "").strip().lower()
+    note = str(body.get("note") or "").strip()
+    if not rid:
+        return _fail("缺少 rid")
+    if action not in ("confirm", "correct", "reject"):
+        return _fail("action 只能是 confirm / correct / reject")
+    agent = get_agent()
+    agent.ensure_space(space_id)
+    kg = KGStore(agent.db)
+    result = kg.update_belief(space_id, rid, action=action, note=note)
+    if not result.get("updated"):
+        return _fail("信念不存在", 404)
+    return jsonify({"ok": True, "belief": kg.get_belief(space_id, rid)})
+
+
+@app.get("/api/memory/corrections")
+def memory_corrections():
+    """信念纠正审计记录。"""
+    space_id = request.args.get("space_id") or "default"
+    agent = get_agent()
+    agent.ensure_space(space_id)
+    return jsonify(
+        {
+            "ok": True,
+            "corrections": KGStore(agent.db).list_corrections(
+                space_id, limit=int(request.args.get("limit") or 100)
+            ),
+        }
+    )
+
+
 @app.get("/api/topics")
 def topics():
     """主题（往事）列表。"""
@@ -767,6 +930,39 @@ def persona_history():
             "history": get_agent().persona_history(space_id, limit=limit),
         }
     )
+
+
+@app.post("/api/persona/freeze")
+def persona_freeze():
+    """
+    冻结 / 解冻人格。
+
+    body: {"space_id"?, "frozen": true|false}
+    冻结后事实与经验照常沉淀，但人格参数、情景与自我认知不再变化。
+    """
+    body = _body()
+    space_id = str(body.get("space_id") or "default").strip() or "default"
+    frozen = bool(body.get("frozen"))
+    agent = get_agent()
+    agent.ensure_space(space_id)
+    kernel = PersonaKernel(agent.db, space_id)
+    return jsonify({"ok": True, "frozen": kernel.set_frozen(frozen)})
+
+
+@app.post("/api/persona/reset")
+def persona_reset():
+    """
+    把人格参数回退到出厂基线（不删记忆）。
+
+    body: {"space_id"?}
+    """
+    body = _body()
+    space_id = str(body.get("space_id") or "default").strip() or "default"
+    agent = get_agent()
+    agent.ensure_space(space_id)
+    kernel = PersonaKernel(agent.db, space_id)
+    result = kernel.reset_to_baseline()
+    return jsonify({"ok": True, **result})
 
 
 # ============================================================
@@ -835,7 +1031,7 @@ def proactive_tick():
     立即检查/触发一次主动联系。
 
     body: {"space_id"?, "session_id"?, "force"?}
-    force=true 跳过时间表直接发一条（调试用；发完会重新排期）。
+    force=true 跳过时间表与用户偏好限制直接发一条（调试用；发完会重新排期）。
     """
     body = _body()
     space_id = str(body.get("space_id") or _ui_space()).strip() or _ui_space()
@@ -845,6 +1041,66 @@ def proactive_tick():
     )
     force = bool(body.get("force"))
     return jsonify(get_agent().proactive_tick(space_id, session_id, force=force))
+
+
+@app.get("/api/proactive/policy")
+def proactive_policy_get():
+    """主动联系偏好（免打扰 / 每日上限 / 冷却 / 跳过本轮）。"""
+    space_id = request.args.get("space_id") or _ui_space()
+    agent = get_agent()
+    agent.ensure_space(space_id)
+    store = ProactivePolicyStore(agent.db)
+    return jsonify(
+        {
+            "ok": True,
+            "policy": store.get(space_id),
+            "sent_today": store.sent_today(space_id),
+            "last_sent_ts": store.last_sent_ts(space_id),
+        }
+    )
+
+
+@app.post("/api/proactive/policy")
+def proactive_policy_set():
+    """
+    保存主动联系偏好。
+
+    body: {"space_id"?, "dnd_start"?, "dnd_end"?, "daily_cap"?,
+           "cooldown_minutes"?, "skip_next"?}
+    """
+    body = _body()
+    space_id = str(body.get("space_id") or _ui_space()).strip() or _ui_space()
+    agent = get_agent()
+    agent.ensure_space(space_id)
+    store = ProactivePolicyStore(agent.db)
+    policy = store.update(
+        space_id,
+        dnd_start=body.get("dnd_start"),
+        dnd_end=body.get("dnd_end"),
+        daily_cap=body.get("daily_cap"),
+        cooldown_minutes=body.get("cooldown_minutes"),
+        skip_next=body.get("skip_next"),
+    )
+    return jsonify({"ok": True, "policy": policy})
+
+
+@app.post("/api/proactive/skip")
+def proactive_skip():
+    """这轮先别发：把下一次主动联系标记为跳过。"""
+    body = _body()
+    space_id = str(body.get("space_id") or _ui_space()).strip() or _ui_space()
+    agent = get_agent()
+    agent.ensure_space(space_id)
+    store = ProactivePolicyStore(agent.db)
+    policy = store.update(space_id, skip_next=True)
+    # 已排期的那一条同步标记为 skipped（调度器不会再兑现它）
+    try:
+        ProactiveScheduleStore(agent.db).skip(
+            space_id, config.PROACTIVE_SESSION_ID
+        )
+    except Exception:
+        pass
+    return jsonify({"ok": True, "policy": policy})
 
 
 # ============================================================
@@ -887,6 +1143,31 @@ def _start_proactive_scheduler() -> None:
         target=_proactive_loop, name="proactive-scheduler", daemon=True
     ).start()
     print("[主动消息] 后台调度已启动")
+
+
+# 无论用 python api/server.py，还是 flask run / 其他 WSGI 启动方式，
+# 都保证后台调度线程一定会起来：第一次请求时拉起（幂等）。
+@app.before_request
+def _check_api_token():
+    """
+    可选鉴权：设置 API_TOKEN 后，所有 /api/* 请求必须带令牌。
+
+    令牌可放在请求头 X-API-Token，或查询参数 ?token=。
+    /api/health 与静态资源不拦截，便于健康检查与页面加载。
+    """
+    token = config.API_TOKEN
+    if not token:
+        return None
+    path = request.path or ""
+    if not path.startswith("/api/") or path == "/api/health":
+        return None
+    supplied = request.headers.get("X-API-Token") or request.args.get("token") or ""
+    if supplied == token:
+        return None
+    return jsonify({"ok": False, "error": "未授权：缺少或错误的 API 令牌"}), 401
+
+
+app.before_request(_start_proactive_scheduler)
 
 
 # ============================================================

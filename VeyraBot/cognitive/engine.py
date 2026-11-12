@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -38,6 +39,7 @@ from cognitive.session import SessionManager
 from cognitive.storage.affection_store import (
     AffectionStore,
     ProactiveOutbox,
+    ProactivePolicyStore,
     ProactiveScheduleStore,
 )
 from cognitive.storage.database import Database
@@ -202,9 +204,13 @@ class CognitiveAgent:
         started_at = time.time()
         self.ensure_space(space_id)
 
+        # ---------- 本轮轮次标识（P0：归档幂等依赖轮次，同一轮只沉淀一次） ----------
+        turn_id = new_id("turn")
+
         debug: Dict[str, Any] = {
             "space_id": space_id,
             "session_id": session_id,
+            "turn_id": turn_id,
             "compress": {},
             "judge": {},
             "memory": {},
@@ -226,7 +232,7 @@ class CognitiveAgent:
 
         # ---------- 步骤 1-2：加载会话并追加用户消息 ----------
         context = self.sessions.get_or_create(session_id, space_id)
-        self.sessions.append(context, "user", user_message)
+        self.sessions.append(context, "user", user_message, turn_id=turn_id)
 
         # ---------- 步骤 3：token 统计与兜底压缩 ----------
         compress_report = self.sessions.maybe_compress(context)
@@ -376,13 +382,15 @@ class CognitiveAgent:
         # session_store 存多条 assistant 消息，历史加载时直接还原成多个气泡。
         answer_parts = split_reply(answer)
         for part in answer_parts:
-            self.sessions.append(context, "assistant", part)
+            self.sessions.append(context, "assistant", part, turn_id=turn_id)
 
         # ---------- 步骤 10：主动归档 ----------
-        try:
-            archive_report = self.archiver.archive(context)
-        except Exception as exc:  # 归档失败绝不阻塞对外响应
-            archive_report = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        if config.ARCHIVE_SYNC:
+            archive_report = self._run_archive(context, user_message, answer_parts, turn_id)
+        else:
+            # ARCHIVE_SYNC=false：放到后台线程，避免阻塞用户响应。
+            # 后台线程复用同一套归档逻辑，正常情况与同步模式一致。
+            archive_report = self._archive_async(context, user_message, answer_parts, turn_id)
         debug["archive"] = archive_report
 
         # ---------- 步骤 10b：大事 → 立即做一次事件级沉淀 ----------
@@ -444,6 +452,64 @@ class CognitiveAgent:
     # ------------------------------------------------------------
     # 观测接口
     # ------------------------------------------------------------
+    def _run_archive(
+        self,
+        context: SessionContext,
+        user_message: str,
+        answer_parts: Optional[List[str]] = None,
+        turn_id: str = "",
+    ) -> Dict[str, Any]:
+        """
+        执行一次完整归档（同步或后台线程共用同一套逻辑）。
+
+        :param context: 会话对象
+        :param user_message: 本轮用户原话
+        :param answer_parts: 本轮回答气泡列表
+        :param turn_id: 本轮标识（幂等判断的依据）
+        :return: 归档报告
+        """
+        try:
+            return self.archiver.archive(context, user_message, answer_parts, turn_id)
+        except Exception as exc:
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def _archive_async(
+        self,
+        context: SessionContext,
+        user_message: str,
+        answer_parts: Optional[List[str]] = None,
+        turn_id: str = "",
+    ) -> Dict[str, Any]:
+        """
+        后台归档：不阻塞用户响应（ARCHIVE_SYNC=false 时使用）。
+
+        :param context: 会话对象
+        :param user_message: 本轮用户原话
+        :param answer_parts: 本轮回答气泡列表
+        :param turn_id: 本轮标识
+        :return: 归档报告（正常时立即返回）
+        """
+
+        def _run() -> None:
+            try:
+                report = self._run_archive(
+                    context, user_message, answer_parts, turn_id
+                )
+            except Exception as exc:
+                report = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            print(f"[归档] 后台线程：{report}")
+
+        threading.Thread(target=_run, name="archive-thread", daemon=True).start()
+        # 后台归档尚未完成，先返回一个明确的"已提交"报告，
+        # 避免调用方把 None 当成归档失败写进 debug。
+        return {
+            "ok": True,
+            "async": True,
+            "skipped": False,
+            "is_big_event": False,
+            "turn_id": turn_id,
+        }
+
     def persona_state(self, space_id: str = "default") -> Dict[str, Any]:
         """
         读取当前人格状态（用于调试与展示）。
@@ -457,6 +523,7 @@ class CognitiveAgent:
 
         return {
             "version": snapshot.version,
+            "frozen": kernel.is_frozen(),
             "self_view": snapshots.current_self_view(),
             "narrative": snapshot.narrative,
             "kernel": kernel.get_params(),
@@ -597,6 +664,21 @@ class CognitiveAgent:
 
         schedule_store = ProactiveScheduleStore(self.db)
         outbox = ProactiveOutbox(self.db)
+        policy_store = ProactivePolicyStore(self.db)
+
+        # 用户偏好优先于模型排期：免打扰 / 每日上限 / 冷却 / "这轮先别发"。
+        # force=true 只在显式调试时跳过这些限制，但仍尊重"跳过本轮"。
+        if not force:
+            blocked = policy_store.block_reason(space_id)
+            if blocked:
+                if blocked == "skip_next":
+                    policy_store.consume_skip(space_id)
+                return {
+                    "ok": True,
+                    "sent": False,
+                    "reason": blocked,
+                    "policy": policy_store.get(space_id),
+                }
 
         # 堆积保护：未读主动消息太多时先不发，等界面取走（ack）后再说
         pending = outbox.list_messages(

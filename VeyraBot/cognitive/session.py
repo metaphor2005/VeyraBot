@@ -151,15 +151,22 @@ class SessionManager:
         )
         connection.commit()
 
-    def append(self, context: SessionContext, role: str, content: str) -> None:
+    def append(
+        self,
+        context: SessionContext,
+        role: str,
+        content: str,
+        turn_id: str = "",
+    ) -> None:
         """
         追加一条消息并立即持久化。
 
         :param context: 会话对象
         :param role: 角色
         :param content: 正文
+        :param turn_id: 本轮轮次标识（同一轮的用户消息与全部回复气泡共用）
         """
-        context.append(role, content)
+        context.append(role, content, turn_id=turn_id)
         self.save(context)
 
     # ------------------------------------------------------------

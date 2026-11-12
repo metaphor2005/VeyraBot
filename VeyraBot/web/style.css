@@ -497,6 +497,35 @@ html[data-theme="dark"] .icon-moon { display: none; }
 .profile-avatar-row { display: flex; gap: 20px; align-items: flex-start; margin-top: 6px; }
 .profile-avatar-actions { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; }
 
+/* 记忆 / 人格 - 信念列表 */
+.setting-divider { border-top: 1px solid var(--border); margin: 18px 0 14px; }
+.belief-list { display: flex; flex-direction: column; gap: 8px; max-height: 300px; overflow-y: auto; }
+.belief-item {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--panel, transparent);
+}
+.belief-main { flex: 1; min-width: 0; }
+.belief-text { font-size: 13px; line-height: 1.5; word-break: break-word; }
+.belief-meta { font-size: 11px; color: var(--text-sub); margin-top: 3px; }
+.belief-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.belief-actions button { font-size: 11px; padding: 4px 8px; }
+.belief-status {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-sub);
+  flex-shrink: 0;
+}
+.belief-status.candidate { color: #b07b1f; border-color: #b07b1f55; }
+.belief-status.rejected { color: #b03b3b; border-color: #b03b3b55; }
+.belief-empty { font-size: 12px; color: var(--text-sub); padding: 6px 0; }
+
 /* 滚动条 */
 ::-webkit-scrollbar { width: 7px; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }

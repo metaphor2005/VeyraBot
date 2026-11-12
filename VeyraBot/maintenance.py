@@ -318,6 +318,127 @@ def cmd_logs(db: Database, spaces: List[str], limit: int) -> int:
     return 0
 
 
+def cmd_export(db: Database, spaces: List[str], out_path: str) -> int:
+    """
+    导出记忆与人格为 JSON（可读、可迁移、可审计）。
+
+    :param db: 数据库对象
+    :param spaces: 空间列表
+    :param out_path: 导出文件路径（.json）
+    :return: 0 成功
+    """
+    payload = {
+        "exported_at": int(time.time()),
+        "exported_at_text": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "spaces": {},
+    }
+    for space_id in spaces:
+        kg = KGStore(db)
+        topics = TopicStore(db)
+        kernel = PersonaKernel(db, space_id)
+        connection = db.conn()
+        experiences = [
+            dict(row)
+            for row in connection.execute(
+                "select exp_id, topic_id, content, create_ts from experience"
+                " where space_id = ? order by create_ts",
+                (space_id,),
+            ).fetchall()
+        ]
+        payload["spaces"][space_id] = {
+            "persona": {
+                "version": kernel.get_current_version(),
+                "frozen": kernel.is_frozen(),
+                "self_view": kernel.get_live_self_view(),
+                "params": kernel.get_params(),
+                "baseline": kernel.get_baseline(),
+                "moods": kernel.get_moods(),
+            },
+            "beliefs": kg.list_beliefs(space_id, only_active=False, limit=100000),
+            "corrections": kg.list_corrections(space_id, limit=100000),
+            "topics": [t.to_dict() for t in topics.list_topics(space_id, limit=100000)],
+            "experiences": experiences,
+        }
+
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"[导出] 已写入 {path}（{len(spaces)} 个空间）")
+    return 0
+
+
+def cmd_backup(keep: int = 10) -> int:
+    """
+    备份运行时数据：数据库 + 向量索引 + 人格快照。
+
+    备份放在 data/backups/ 下，按时间戳命名；只保留最近的 keep 份。
+
+    :param keep: 保留份数
+    :return: 0 成功
+    """
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    target = config.DB_PATH.parent / "backups" / f"backup_{stamp}"
+    target.mkdir(parents=True, exist_ok=True)
+
+    if config.DB_PATH.is_file():
+        shutil.copy2(config.DB_PATH, target / config.DB_PATH.name)
+    for source, name in (
+        (config.VECTOR_DIR, "vectors"),
+        (config.SNAPSHOT_DIR, "persona_snapshots"),
+    ):
+        if source.is_dir():
+            shutil.copytree(source, target / name, dirs_exist_ok=True)
+
+    backups = sorted(
+        (p for p in (config.DB_PATH.parent / "backups").iterdir() if p.is_dir()),
+        key=lambda p: p.name,
+    )
+    for old in backups[:-keep] if keep > 0 else []:
+        shutil.rmtree(old, ignore_errors=True)
+
+    print(f"[备份] 已写入 {target}")
+    return 0
+
+
+def cmd_reset(db: Database, spaces: List[str]) -> int:
+    """
+    清空指定空间的运行时记忆（人格回到出厂基线），保留人格原始资产。
+
+    这是破坏性操作，必须显式传 --yes；建议先 --export / --backup。
+
+    :param db: 数据库对象
+    :param spaces: 空间列表
+    :return: 0 成功
+    """
+    connection = db.conn()
+    tables = [
+        row["name"]
+        for row in connection.execute(
+            "select name from sqlite_master where type = 'table'"
+        ).fetchall()
+    ]
+    for space_id in spaces:
+        for table in tables:
+            columns = [
+                row["name"]
+                for row in connection.execute(
+                    f"pragma table_info({table})"
+                ).fetchall()
+            ]
+            if "space_id" not in columns:
+                continue
+            connection.execute(
+                f"delete from {table} where space_id = ?", (space_id,)
+            )
+        connection.commit()
+        # 重新写入出厂人格参数，避免下一次启动时读到空内核
+        PersonaKernel(db, space_id)
+        print(f"[重置] 空间 {space_id} 的运行时记忆已清空，人格回到基线")
+    return 0
+
+
 def main() -> int:
     """命令行入口。"""
     parser = argparse.ArgumentParser(
@@ -330,6 +451,10 @@ def main() -> int:
     parser.add_argument("--prune-snapshots", action="store_true", help="快照冷存")
     parser.add_argument("--seed-persona", action="store_true", help="注入人格的既有记忆（前史/关系网/档案）")
     parser.add_argument("--persona-info", action="store_true", help="打印人格原始数据与运行时数据位置")
+    parser.add_argument("--export", default="", metavar="PATH", help="导出记忆与人格为 JSON")
+    parser.add_argument("--backup", action="store_true", help="备份数据库 / 向量 / 人格快照")
+    parser.add_argument("--reset", action="store_true", help="清空运行时记忆（破坏性，需 --yes）")
+    parser.add_argument("--yes", action="store_true", help="确认执行破坏性操作")
     parser.add_argument("--keep", type=int, default=config.SNAPSHOT_RETAIN_VERSIONS, help="快照保留版本数")
     parser.add_argument("--force", action="store_true", help="日结时忽略最少条数阈值")
     parser.add_argument("--limit", type=int, default=10, help="日志返回条数")
@@ -363,11 +488,24 @@ def main() -> int:
             args.prune_snapshots,
             args.seed_persona,
             args.persona_info,
+            bool(args.export),
+            args.backup,
+            args.reset,
         ]
     ):
         return cmd_stats(db, spaces)
 
     status = 0
+    if args.export:
+        status |= cmd_export(db, spaces, args.export)
+    if args.backup:
+        status |= cmd_backup()
+    if args.reset:
+        if not args.yes:
+            print("[重置] 这是破坏性操作：请先 --export / --backup，再带 --yes 重试")
+            status |= 2
+        else:
+            status |= cmd_reset(db, spaces)
     if args.persona_info:
         status |= cmd_persona_info()
     if args.seed_persona:

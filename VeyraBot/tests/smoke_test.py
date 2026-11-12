@@ -1082,5 +1082,369 @@ def main() -> int:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+# ============================================================
+# P0 / P1 增强测试（轮次感知归档、信念溯源、用户纠正）
+# ============================================================
+
+
+def _make_context(tmp_dir: Path, messages: list) -> SessionContext:
+    """构造一个会话；消息统一转成 Message，避免用 dict 冒充实体的模型对象。"""
+    from cognitive.models import Message
+
+    db = Database(tmp_dir / "p0.db")
+    db.ensure_space("sp0", "测试")
+    items = [
+        Message(role=item["role"], content=item["content"])
+        if isinstance(item, dict)
+        else item
+        for item in messages
+    ]
+    return SessionContext(session_id="s0", space_id="sp0", messages=items)
+
+
+def test_p0_turn_aware_transcript(tmp_dir: Path) -> None:
+    """验证：多气泡回复能正确回溯本轮文本，用户气泡不被误标为 assistant。"""
+    from cognitive.cognition.archiver import MemoryArchiver
+
+    archiver = MemoryArchiver(Database(tmp_dir / "p0.db"), client=None)
+    context = _make_context(tmp_dir, [
+        {"role": "user", "content": "今天想和她说点什么"},
+        {"role": "assistant", "content": "我大概会想一下这件事。"},
+        {"role": "assistant", "content": "我也觉得这是值得聊的方向。"},
+    ])
+
+    report = archiver.archive(
+        context,
+        user_message="今天想和她说点什么",
+        answer_parts=["我大概会想一下这件事。", "我也觉得这是值得聊的方向。"],
+        turn_id="turn_20260101",
+    )
+    _assert(report["ok"] is True, "归档应成功")
+    _assert(report["duplicate"] is False, "首次归档不应标记重复")
+
+    text = archiver._build_transcript(
+        context,
+        user_message="今天想和她说点什么",
+        answer_parts=["我大概会想一下这件事。", "我也觉得这是值得聊的方向。"],
+        turn_id="turn_20260101",
+    )
+    expected = (
+        "user: 今天想和她说点什么\n"
+        "assistant: 我大概会想一下这件事。\n"
+        "assistant: 我也觉得这是值得聊的方向。"
+    )
+    _assert(text == expected, f"位置回溯应还原本轮气泡，实际：{text!r}")
+
+    fallback = archiver._build_transcript(context, turn_id="turn_20260101")
+    _assert(
+        fallback.startswith(
+            "user: 今天想和她说点什么\nassistant: 我大概会想一下这件事。"
+        ),
+        "位置兜底也应能回溯本轮气泡",
+    )
+
+    mixed = archiver._build_transcript(context, user_message="", answer_parts=["a", "b"])
+    _assert(
+        "assistant: a" in mixed and "assistant: b" in mixed,
+        "answer_parts 应原样注入为回复气泡",
+    )
+
+
+def test_p0_archiver_idempotent(tmp_dir: Path) -> None:
+    """验证：同一轮重复归档只沉淀一次（幂等）。"""
+    from cognitive.cognition.archiver import MemoryArchiver
+
+    archiver = MemoryArchiver(Database(tmp_dir / "p0db.db"), client=None)
+    context = _make_context(tmp_dir, [
+        {"role": "user", "content": "先归档一次"},
+        {"role": "assistant", "content": "第一版回答。"},
+    ])
+
+    report = archiver.archive(
+        context,
+        user_message="先归档一次",
+        answer_parts=["第一版回答。"],
+        turn_id="idem_1",
+    )
+    _assert(report["ok"] is True, "首次归档应成功")
+    _assert(report["duplicate"] is False, "首次不应标记重复")
+
+    again = archiver.archive(
+        context,
+        user_message="先归档一次",
+        answer_parts=["第一版回答。"],
+        turn_id="idem_1",
+    )
+    _assert(again["duplicate"] is True, "重复归档应标记为重复")
+    _assert(again["skipped"] is True, "重复归档应标记为已跳过")
+    _assert(again["ok"] is True, "幂等返回仍应是成功")
+
+    other = archiver.archive(
+        context,
+        user_message="换一轮说",
+        answer_parts=["换一轮回答。"],
+        turn_id="idem_2",
+    )
+    _assert(other["ok"] is True, "换一轮应能沉淀")
+    _assert(other["topic_id"] != report["topic_id"], "不同轮次应得到不同主题")
+
+
+def test_p0_judge_uses_explicit_message(tmp_dir: Path) -> None:
+    """验证：大事判定优先用显式用户消息，而非回溯最后一条 user。"""
+    from cognitive.cognition.archiver import judge_big_event
+
+    tech_relations = [
+        {
+            "head": "Topic-Centric",
+            "rel": "区别于",
+            "tail": "Graph RAG",
+            "importance": 0.92,
+        }
+    ]
+    self_relations = [
+        {"head": "江妍", "rel": "喜欢", "tail": "明日方舟", "importance": 0.92}
+    ]
+
+    # 技术问答：无长期指令词、与本人无关 → 不应判大事
+    is_big, reason = judge_big_event(tech_relations, "帮我讲讲这两种做法的区别")
+    _assert(is_big is False, "技术问答不应判为大事")
+
+    # 长期指令词命中 → 大事
+    is_big, reason = judge_big_event(
+        tech_relations, "从今天起，家里的事别往外讲", user_text=""
+    )
+    _assert(is_big is True, "长期指令词应判大事")
+
+    # 高重要度且涉及本人 → 判大事
+    is_big, reason = judge_big_event(
+        self_relations, "你是不是不高兴被这么说", user_text="x"
+    )
+    _assert(is_big is True, "涉及本人的高价值信念应判大事")
+
+
+def test_p1_belief_provenance(tmp_dir: Path) -> None:
+    """验证：信念带溯源字段，支持读取、确认、纠正与审计。"""
+    from cognitive.storage.kg_store import KGStore
+
+    db = Database(tmp_dir / "p1.db")
+    db.ensure_space("sp1", "测试")
+    kg = KGStore(db)
+
+    kg.upsert_entity(
+        KGEntity(eid="e1", etype="Belief", name="账号", space_id="sp1", attrs={})
+    )
+    kg.upsert_relation(
+        KGRelation(
+            rid="r1",
+            space_id="sp1",
+            head_name="账号",
+            rel="喜欢",
+            tail_name="明日方舟",
+            confidence=0.7,
+            importance=0.9,
+            source_turn_id="turn_9",
+            source_type="user_stated",
+            valid_from=100,
+            valid_to=1000,
+            user_confirmed=False,
+        )
+    )
+
+    rows = kg.list_beliefs("sp1")
+    _assert(len(rows) == 1, "应能列出该信念")
+    row = rows[0]
+    _assert(row["source_type"] == "user_stated", "溯源类型应为 user_stated")
+    _assert(row["source_turn_id"] == "turn_9", "应记录来源轮次")
+    _assert(row["valid_to"] == 1000, "应记录生效/失效时间")
+    _assert(row["user_confirmed"] is False, "首次确认应为未确认")
+
+    by_status = kg.list_beliefs("sp1", status="active")
+    _assert(len(by_status) == 1 and by_status[0]["rid"] == "r1", "按状态过滤应命中")
+
+    result = kg.update_belief(
+        "sp1", "r1", status="candidate", user_confirmed=True,
+        source_turn_id="turn_9", source_type="user_stated",
+    )
+    _assert(result["updated"] is True, "应成功更新信念")
+    _assert(kg.get_belief("sp1", "r1")["status"] == "candidate", "状态应更新")
+    _assert(kg.get_belief("sp1", "r1")["user_confirmed"] is True, "确认状态应落库")
+
+    for action, note in (("confirm", "用户确认"), ("correct", "用户纠正")):
+        ledger = kg._append_correction("sp1", action, note)
+        _assert(len(ledger) == 1, f"{action} 应写入审计记录")
+    _assert(any("clr" in r["correction_id"] for r in ledger), "审计记录应带 id")
+
+    audit = db.conn().execute(
+        "select action, note from belief_correction where space_id = 'sp1' order by create_ts"
+    ).fetchall()
+    _assert(
+        {(r["action"], r["note"]) for r in audit}
+        == {("confirm", "用户确认"), ("correct", "用户纠正")},
+        f"审计表内容不符：{[tuple(r) for r in audit]}",
+    )
+
+
+def test_p1_user_correction_api_shape(tmp_dir: Path) -> None:
+    """验证：API 层能为信念提供确认/纠正/否决三类操作。"""
+    from cognitive.storage.kg_store import KGStore
+
+    db = Database(tmp_dir / "p1api.db")
+    db.ensure_space("sp1api", "测试")
+    kg = KGStore(db)
+    kg.upsert_relation(
+        KGRelation(rid="r9", space_id="sp1api", head_name="用户", rel="prefer", tail_name="简洁",
+                   confidence=0.6, importance=0.5)
+    )
+    _assert(kg.confirm_belief("sp1api", "r9") is True, "确认应成功")
+    _assert(kg.correct_belief("sp1api", "r9") is True, "纠正应成功")
+    _assert(kg.reject_belief("sp1api", "r9") is True, "否决应成功")
+
+
+def test_p2_persona_freeze_reset(tmp_dir: Path) -> None:
+    """验证：人格可冻结、可回退到基线，记忆不被牵连。"""
+    db = Database(tmp_dir / "p2.db")
+    db.ensure_space("sp2p", "测试")
+    kernel = PersonaKernel(db, "sp2p")
+
+    _assert(kernel.is_frozen() is False, "默认不应冻结")
+    kernel.set_frozen(True)
+    _assert(kernel.is_frozen() is True, "冻结应落库")
+    kernel.set_frozen(False)
+    _assert(kernel.is_frozen() is False, "解冻应落库")
+
+    # 演化一次，再回退
+    kernel.apply_deltas({"prefer_decompose": 0.2})
+    changed = kernel.get_params()["prefer_decompose"]
+    _assert(
+        abs(changed - config.PERSONA_KERNEL_INIT["prefer_decompose"]) > 1e-6,
+        "参数应已发生变化",
+    )
+    result = kernel.reset_to_baseline()
+    _assert(
+        abs(
+            kernel.get_params()["prefer_decompose"]
+            - config.PERSONA_KERNEL_INIT["prefer_decompose"]
+        )
+        < 1e-6,
+        "回退后参数应等于基线",
+    )
+    _assert(result["after"]["prefer_decompose"] == result["baseline"]["prefer_decompose"],
+            "回退摘要应与基线一致")
+
+
+def test_p2_proactive_policy(tmp_dir: Path) -> None:
+    """验证：免打扰 / 每日上限 / 冷却 / 跳过本轮 都按用户偏好生效。"""
+    from cognitive.storage.affection_store import (
+        ProactiveOutbox,
+        ProactivePolicyStore,
+    )
+
+    db = Database(tmp_dir / "p2policy.db")
+    db.ensure_space("sp2policy", "测试")
+    store = ProactivePolicyStore(db)
+    outbox = ProactiveOutbox(db)
+
+    policy = store.get("sp2policy")
+    _assert(policy["daily_cap"] >= 1, "默认应有每日上限")
+
+    # 冷却：刚发过一条 → 阻止
+    outbox.add("sp2policy", "initiative", "你", "在吗", session_id="main")
+    _assert(store.block_reason("sp2policy") == "cooldown", "刚发送应处于冷却")
+
+    # 关闭冷却与上限后可通过
+    store.update("sp2policy", cooldown_minutes=0, daily_cap=0, dnd_start=0, dnd_end=0)
+    _assert(store.block_reason("sp2policy") == "", "无关卡时应允许发送")
+
+    # 免打扰：23 点开始、8 点结束，凌晨 3 点应命中
+    store.update("sp2policy", dnd_start=23, dnd_end=8)
+    midnight = int(
+        __import__("time").mktime(
+            (2026, 1, 1, 3, 0, 0, 0, 0, -1)
+        )
+    )
+    _assert(
+        ProactivePolicyStore.in_dnd(store.get("sp2policy"), midnight) is True,
+        "凌晨 3 点应在免打扰时段",
+    )
+    noon = int(
+        __import__("time").mktime(
+            (2026, 1, 1, 12, 0, 0, 0, 0, -1)
+        )
+    )
+    _assert(
+        ProactivePolicyStore.in_dnd(store.get("sp2policy"), noon) is False,
+        "中午不应在免打扰时段",
+    )
+
+    # 跳过本轮：标记 → 阻止 → 消费一次后恢复
+    store.update("sp2policy", skip_next=True, dnd_start=0, dnd_end=0)
+    _assert(store.block_reason("sp2policy") == "skip_next", "应阻止一次")
+    _assert(store.consume_skip("sp2policy") is True, "应消费掉跳过标记")
+    _assert(store.block_reason("sp2policy") == "", "消费后应恢复")
+
+
+def main() -> int:
+    """执行全部冒烟测试。"""
+    tmp_dir = Path(tempfile.mkdtemp(prefix="cognitive_test_"))
+    try:
+        # 向量索引与人格快照一律写进临时目录：测试不得污染 data/（真实人格库）。
+        config.VECTOR_DIR = tmp_dir / "vectors"
+        config.VECTOR_DIR.mkdir(parents=True, exist_ok=True)
+        config.SNAPSHOT_DIR = tmp_dir / "persona_snapshots"
+        config.SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+
+        tests = [
+            ("KG 冲突检测", test_kg_conflict),
+            ("KG 权重加固", test_kg_boost),
+            ("KG 加固(生产路径)", test_kg_boost_production_rid),
+            ("向量检索", test_vector_search),
+            ("改写式召回", test_vector_rewrite_recall),
+            ("归并后召回过滤", test_router_consolidated_filter),
+            ("人格参数演化", test_persona_delta),
+            ("情景状态衰减", test_mood_decay),
+            ("主题与会话", test_topic_and_session),
+            ("检索循环有界", test_rag_loop_bounds),
+            ("50轮短期窗口", test_history_window),
+            ("日结归并", test_daily_consolidate),
+            ("大事标记", test_big_event_marking),
+            ("表结构迁移", test_schema_migration),
+            ("人格基调抗漂移", test_persona_baseline),
+            ("基调日结推进", test_persona_daily_promotion),
+            ("曾被推翻展示", test_overturned_beliefs),
+            ("大事判定收紧", test_big_event_gate),
+            ("多值信念共存", test_kg_multi_valued),
+            ("好感度状态机", test_affection_state_machine),
+            ("主动消息发件箱", test_proactive_outbox),
+            ("主动消息模板降级", test_proactive_template_fallback),
+            ("主动联系时间表", test_proactive_schedule),
+            ("主动消息记忆抽样", test_proactive_memory_pick),
+            ("人格原始数据目录", test_persona_assets),
+            ("P0 轮次感知归档", test_p0_turn_aware_transcript),
+            ("P0 归档幂等", test_p0_archiver_idempotent),
+            ("P0 大事判定显式消息", test_p0_judge_uses_explicit_message),
+            ("P1 信念溯源", test_p1_belief_provenance),
+            ("P1 用户纠正", test_p1_user_correction_api_shape),
+            ("P2 人格冻结与回退", test_p2_persona_freeze_reset),
+            ("P2 主动联系偏好", test_p2_proactive_policy),
+        ]
+
+        failed = 0
+        for name, func in tests:
+            try:
+                func(tmp_dir)
+                print(f"[通过] {name}")
+            except AssertionError as exc:
+                failed += 1
+                print(f"[失败] {name}：{exc}")
+            except Exception as exc:
+                failed += 1
+                print(f"[异常] {name}：{type(exc).__name__}: {exc}")
+
+        print(f"\n共 {len(tests)} 项，失败 {failed} 项")
+        return 0 if failed == 0 else 1
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     sys.exit(main())
